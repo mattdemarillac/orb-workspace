@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# orb-workspace: build an isolated OrbStack Linux machine holding every checkout
-# that belongs to a set of GitHub orgs, with its own toolchain, Docker Engine,
-# GitHub login and Claude Code. Safe to re-run: each step skips what is done.
+# orb-workspace: run a second, separate Claude Code (its own login) in an
+# OrbStack Linux machine that otherwise matches the Mac: same repos, env files,
+# Claude config and Mac tools. Safe to re-run: each step skips what is done.
 #
 # The script runs on the Mac to create the machine, then re-runs itself inside
 # the machine (the Mac filesystem is visible there under /mnt/mac).
@@ -29,13 +29,16 @@ Steps (default: all of them; naming any step runs only the named ones)
                      (Xcode, simulators, Android SDK, IDEs, the Mac's Docker as
                      docker-mac) through OrbStack's `mac`, and a section in the
                      machine's ~/.claude/CLAUDE.md telling agents how it all works
-  --clone           clone from the Mac checkouts: same branch, uncommitted
+  --clone            clone from the Mac checkouts: same branch, uncommitted
                      changes, worktrees; origin rewritten to GitHub HTTPS
   --secrets          copy gitignored env/key/cert files from the Mac checkouts,
                      plus ~/.npmrc and Composer auth (never overwrites)
+  --claude           copy the Mac's Claude Code setup: settings, hooks, plugins,
+                     skills, MCP servers, per-repo permissions (hooks and MCP
+                     servers run on the Mac via `mac`); not login/history/memory
   --auth             gh login inside the machine (interactive); git and Composer
                      then use it
-  --deps             composer install, yarn / npm ci / pnpm install per repo
+  --deps             seed vendor/ from the Mac, composer install, yarn / npm ci / pnpm install per repo
   --docker           from each repo's compose file: create external networks,
                      add host-gateway hosts to /etc/hosts, grant container uids
                      access to the checkout; build + start the stacks in --up
@@ -128,7 +131,7 @@ while [[ $# -gt 0 ]]; do
     --hook) HOOK=$2; shift 2 ;;
     --secret-regex) EXTRA_RE=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    --toolchain|--folders|--mac|--clone|--secrets|--auth|--deps|--docker) STEPS+=" ${1#--}"; shift ;;
+    --toolchain|--folders|--mac|--clone|--secrets|--claude|--auth|--deps|--docker) STEPS+=" ${1#--}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -199,7 +202,7 @@ for i in "${!NAMES[@]}"; do
   extra=""; [[ -n "${MAINS[i]}" ]] && extra="  (worktree of ${MAINS[i]})"
   info "$(printf '%-28s %s%s' "${NAMES[i]}" "${SLUGS[i]}" "$extra")"
 done
-info "steps: ${STEPS:- toolchain folders mac clone secrets auth deps docker}${HOOK:+ hook}"
+info "steps: ${STEPS:- toolchain folders mac clone secrets claude auth deps docker}${HOOK:+ hook}"
 ((${#UP[@]})) && info "start stacks: ${UP[*]}"
 [[ $DRY == 1 ]] && exit 0
 
@@ -452,6 +455,68 @@ if want secrets; then
   fi
 fi
 
+# --- claude config ---------------------------------------------------------
+# Same Claude Code setup as the Mac (settings, hooks, plugins, skills, MCP
+# servers, per-repo permissions); only the login, history and memory differ.
+# Hooks and stdio MCP servers run on the Mac through `mac`, so Mac-only
+# programs behave exactly as they do there.
+BRIDGE_JQ='def bridge:
+  if (.type // "stdio") == "stdio" and .command != "mac" then
+    # One quoted shell string: `mac` would rewrite separate absolute-path args
+    # (/opt/homebrew/…) into this machine'"'"'s files. It also does not pass env vars.
+    { type: "stdio", command: "mac",
+      args: ["sh", "-c", ("exec " + (((if (.env // {}) != {} then ["env"] + (.env | to_entries | map("\(.key)=\(.value)")) else [] end)
+                                     + [.command] + (.args // [])) | map(@sh) | join(" ")))] }
+  else . end;'
+
+if want claude; then
+  step "Claude Code config (same as the Mac, separate login)"
+  MC="/mnt/mac$HOST_HOME/.claude"; VC="$HOME/.claude"; mkdir -p "$VC"
+
+  if [[ -f "$MC/settings.json" ]]; then
+    [[ -f "$VC/settings.json" && ! -f "$VC/settings.json.orb-workspace-bak" ]] && cp "$VC/settings.json" "$VC/settings.json.orb-workspace-bak"
+    jq '(.hooks // {}) |= with_entries(.value |= map(.hooks |= map(
+          if .type == "command" and (.command | startswith("mac ") | not) then .command = "mac sh -c " + (.command | @sh) else . end)))
+        | if .hooks == {} then del(.hooks) else . end' "$MC/settings.json" >"$VC/settings.json" && info "settings.json (hooks run on the Mac)"
+  fi
+
+  for d in skills agents commands output-styles; do
+    [[ -d "$MC/$d" ]] && rsync -a "$MC/$d/" "$VC/$d/" && info "$d/"
+  done
+  if [[ -d "$MC/plugins" ]]; then
+    rsync -a "$MC/plugins/" "$VC/plugins/"
+    find "$VC/plugins" -maxdepth 1 -name '*.json' -exec sed -i "s#$HOST_HOME/.claude#$HOME/.claude#g" {} +
+    info "plugins/"
+  fi
+
+  if [[ -f "/mnt/mac$HOST_HOME/.claude.json" ]]; then
+    [[ -f "$HOME/.claude.json" ]] || echo '{}' >"$HOME/.claude.json"
+    # Map each included repo's Mac path to its path here.
+    pairs=$(for i in "${!NAMES[@]}"; do printf '%s\t%s\n' "${SRCS[i]#/mnt/mac}" "$DEST/${NAMES[i]}"; done |
+      jq -R 'split("\t") | {(.[0]): .[1]}' | jq -s 'add')
+    jq --argjson pairs "$pairs" --slurpfile mac "/mnt/mac$HOST_HOME/.claude.json" "$BRIDGE_JQ"'
+      .mcpServers = ((.mcpServers // {}) + (($mac[0].mcpServers // {}) | map_values(bridge)))
+      | reduce ($pairs | to_entries[]) as $p (.;
+          ($mac[0].projects[$p.key].mcpServers // {}) as $m
+          | if $m == {} then . else .projects[$p.value].mcpServers = ((.projects[$p.value].mcpServers // {}) + ($m | map_values(bridge))) end)' \
+      "$HOME/.claude.json" >"$HOME/.claude.json.tmp" && mv "$HOME/.claude.json.tmp" "$HOME/.claude.json" &&
+      info "MCP servers: $(jq -r '.mcpServers | keys | join(" ")' "$HOME/.claude.json") (+ per-repo ones)"
+  fi
+
+  for i in "${!NAMES[@]}"; do
+    m="${SRCS[i]}/.claude/settings.local.json"; v="$DEST/${NAMES[i]}/.claude/settings.local.json"
+    [[ -f "$m" && -d "$DEST/${NAMES[i]}" ]] || continue
+    mkdir -p "$(dirname "$v")"; [[ -f "$v" ]] || echo '{}' >"$v"
+    # Mac settings win, but permission lists are combined so nothing approved here is lost.
+    jq -s '.[0] as $v | .[1] as $m | ($v * $m)
+      | reduce ("allow", "deny", "ask") as $k (.;
+          if ($v.permissions[$k] // $m.permissions[$k]) == null then .
+          else .permissions[$k] = ((($v.permissions[$k] // []) + ($m.permissions[$k] // [])) | unique) end)' \
+      "$v" "$m" >"$v.tmp" && mv "$v.tmp" "$v" && info "${NAMES[i]}: .claude/settings.local.json"
+  done
+  NOTES+=("Restart any Claude Code session already running in the machine to pick up the config.")
+fi
+
 # --- auth ------------------------------------------------------------------
 if want auth; then
   step "GitHub auth"
@@ -476,6 +541,12 @@ if want deps; then
   for name in "${NAMES[@]}"; do
     dst="$DEST/$name"; [[ -d "$dst" ]] || continue
     if [[ -f "$dst/composer.json" ]] && command -v composer >/dev/null; then
+      # Start from the Mac's vendor/ (PHP is portable). Composer then only fetches
+      # what differs, so private packages the Mac already has need no GitHub access.
+      src=${SRCS[$(for j in "${!NAMES[@]}"; do [[ "${NAMES[j]}" == "$name" ]] && echo "$j"; done)]}
+      if [[ -d "$src/vendor" && ! -f "$dst/vendor/composer/installed.json" ]]; then
+        rsync -a "$src/vendor/" "$dst/vendor/" && info "$name: vendor/ seeded from the Mac"
+      fi
       (cd "$dst" && composer install -n --no-progress >"$LOGS/$name-composer.log" 2>&1) &&
         info "$name: composer ok" || { FAILED+=("$name composer ($LOGS/$name-composer.log)"); warn "$name: composer failed"; }
     fi

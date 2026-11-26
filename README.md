@@ -1,9 +1,13 @@
 # orb-workspace
 
-Build an isolated [OrbStack](https://orbstack.dev) Linux machine for one set of
-GitHub orgs: its own repos, toolchain, Docker Engine, GitHub login and Claude
-Code. Use it to keep work and personal projects (and their Claude Code config,
-memory and credentials) apart on one Mac.
+Run a second, separate Claude Code on your Mac, signed in to a different
+account, without switching logins.
+
+The second Claude runs in an [OrbStack](https://orbstack.dev) Linux machine.
+Everything else matches the Mac: the same repos, branches and env files, the
+same Claude settings, hooks, plugins, skills and MCP servers, and the same Mac
+tools (Xcode, simulators, the Android SDK) through a bridge. The only
+difference is which Claude is running: its own login, history and memory.
 
 ```bash
 orb-workspace work --org acme --org acme-labs --up api --up web
@@ -35,8 +39,9 @@ flags it runs all of them in this order. Name steps to run only those.
 | `--mac` | bridges macOS tools into the machine: wrappers in `~/.local/bin` for `xcodebuild`, `xcrun` (simulators), `swift`, `pod`, `fastlane`, `adb`, `emulator`, `sdkmanager`, IDE launchers, and `docker-mac` (the Mac's Docker). Each runs on the Mac through OrbStack's `mac`, in the matching folder. Also writes a section into the machine's `~/.claude/CLAUDE.md` that tells agents how the environment works (re-written on each run, the rest of the file is kept) |
 | `--clone` | clones each Mac checkout locally (fast, no network): same branch, uncommitted changes, linked worktrees. `origin` is rewritten to `https://github.com/<owner>/<repo>.git` |
 | `--secrets` | copies gitignored env/key/cert files (`.env*`, `*.env`, `*.pem/.key/.pub/.crt`, `keys/`, `certs/`, `.auth/`, `.npmrc`, …) from the Mac checkouts, plus `~/.npmrc` and Composer `auth.json` (without the GitHub token). Never overwrites |
+| `--claude` | copies the Mac's Claude Code setup: `settings.json`, hooks, plugins, skills, agents, commands, MCP servers (user level and per repo) and each repo's `.claude/settings.local.json` (permission lists are combined). Hooks and stdio MCP servers run on the Mac through `mac`, so Mac-only programs work unchanged. Login, history and memory are not copied |
 | `--auth` | `gh auth login` inside the machine (interactive), then git and Composer use that login |
-| `--deps` | `composer install`, and `yarn` / `npm ci` / `pnpm install` per repo, using the repo's `.nvmrc` |
+| `--deps` | seeds `vendor/` from the Mac checkout (so private packages need no GitHub access), then `composer install`, and `yarn` / `npm ci` / `pnpm install` per repo, using the repo's `.nvmrc` |
 | `--docker` | reads each repo's compose file: creates external networks, adds `host-gateway` hostnames to `/etc/hosts`, lets the containers' uid write the checkout (ACLs). Builds and starts only the stacks named with `--up` |
 | `--hook FILE` | runs your own bash script inside the machine at the end |
 

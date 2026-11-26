@@ -3,6 +3,10 @@
 Notes for coding agents working on this repo. Read `README.md` for what the tool
 does from a user's point of view.
 
+**Purpose:** run a separate Claude Code (its own login) in an OrbStack machine.
+The machine must otherwise match the Mac: nothing more, nothing less. Judge
+every change by that: does it make the machine behave like the Mac?
+
 ## Layout
 
 - `orb-workspace`: the whole tool, one bash script. No dependencies on the Mac
@@ -23,7 +27,7 @@ The script runs twice:
    from the Mac side through `env`.
 
 Steps run in this order: discover repos, `toolchain`, `folders`, `mac`, `clone`,
-`secrets`, `auth`, `deps`, `docker`, hook, summary. `want <step>` decides if a
+`secrets`, `claude`, `auth`, `deps`, `docker`, hook, summary. `want <step>` decides if a
 step runs: all steps when none are named, otherwise only the named ones.
 
 ## Rules
@@ -48,8 +52,10 @@ step runs: all steps when none are named, otherwise only the named ones.
 - **No secrets in output or logs.** Print file counts and names, never values.
   Don't copy the GitHub token from the Mac; `--auth` makes a new one.
 - **OrbStack's `mac` rewrites absolute paths** that also exist in Linux
-  (`/usr/bin/…`, `/bin/sh`) to this machine's files. Call Mac commands by
-  name (`mac xcodebuild`), or by a path under `/Users` or `/Applications`.
+  (`/usr/bin/…`, `/opt/homebrew/…`) to this machine's files, and it does not
+  pass environment variables. Call Mac commands by name (`mac xcodebuild`), or
+  wrap the whole command in one quoted string: `mac sh -c "exec 'cmd' 'arg'"`
+  (that is how bridged hooks and MCP servers work).
   Wrappers carry the `# orb-workspace: macOS bridge` line; only those may be
   rewritten, never a real Linux command of the same name.
 - **The machine's `~/.claude/CLAUDE.md`** belongs to the user. The script only
