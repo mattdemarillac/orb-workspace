@@ -41,7 +41,7 @@ flags it runs all of them in this order. Name steps to run only those.
 | `--secrets` | copies gitignored env/key/cert files (`.env*`, `*.env`, `*.pem/.key/.pub/.crt`, `keys/`, `certs/`, `.auth/`, `.npmrc`, …) from the Mac checkouts, plus `~/.npmrc` and Composer `auth.json` (without the GitHub token). Never overwrites |
 | `--claude` | copies the Mac's Claude Code setup: `settings.json`, hooks, plugins, skills, agents, commands, MCP servers (user level and per repo) and each repo's `.claude/settings.local.json` (permission lists are combined). Hooks and stdio MCP servers run on the Mac through `mac`, so Mac-only programs work unchanged. Login, history and memory are not copied |
 | `--auth` | `gh auth login` inside the machine (interactive), then git and Composer use that login |
-| `--deps` | seeds `vendor/` from the Mac checkout (so private packages need no GitHub access), then `composer install`, and `yarn` / `npm ci` / `pnpm install` per repo, using the repo's `.nvmrc` |
+| `--deps` | seeds `vendor/` from the Mac checkout (so private packages need no GitHub access), then `composer install` (platform requirements ignored: the containers run the code), and `yarn` / `npm ci` / `pnpm install` with the repo's `.nvmrc`. Env vars that `.yarnrc.yml` / `.npmrc` reference are copied from the Mac's login shell. Native modules that fail to build are retried with older-toolchain settings (Python 3.10 for old node-gyp, `-include cstdint` for newer GCC) |
 | `--docker` | reads each repo's compose file: creates external networks, adds `host-gateway` hostnames to `/etc/hosts`, lets the containers' uid write the checkout (ACLs). Builds and starts only the stacks named with `--up` |
 | `--hook FILE` | runs your own bash script inside the machine at the end |
 

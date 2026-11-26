@@ -154,6 +154,7 @@ in_list() { local x=$1; shift; local y; for y in "$@"; do [[ "$x" == "$y" ]] && 
 # Environment lives in one file that login and interactive shells both load
 # (Ubuntu's .bashrc returns early for non-interactive shells, so it can't go there).
 ENV_FILE="$HOME/.orb-workspace.env"
+[[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 add_env() { # add_env 'export X=...'
   touch "$ENV_FILE"; grep -qxF "$1" "$ENV_FILE" || echo "$1" >>"$ENV_FILE"
   local src='[ -f "$HOME/.orb-workspace.env" ] && . "$HOME/.orb-workspace.env"'
@@ -221,6 +222,8 @@ if want toolchain; then
   done
 
   pkgs="git curl ca-certificates unzip openssl jq make rsync acl build-essential python3-setuptools gh docker.io docker-compose-v2 docker-buildx"
+  # Libraries common native Node modules build against (canvas, sharp, ...).
+  ((need_node)) && pkgs+=" pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev libpixman-1-dev"
   ((need_php)) && pkgs+=" php-cli php-xml php-gd php-mbstring php-curl php-zip php-bcmath php-mysql php-intl"
   info "apt: installing packages"
   sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
@@ -535,32 +538,74 @@ if want auth; then
 fi
 
 # --- deps ------------------------------------------------------------------
+# Env vars that package-manager configs read (${VAR} in .yarnrc.yml / .npmrc),
+# taken from the Mac's login shell so installs behave as they do on the Mac.
+import_mac_env() {
+  local v val
+  for v in $(cat "$HOME/.npmrc" "$DEST"/*/.yarnrc.yml "$DEST"/*/.npmrc 2>/dev/null |
+             grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*' | cut -c3- | sort -u); do
+    [[ -n "${!v:-}" ]] && continue
+    val=$(mac sh -c "exec \"\$SHELL\" -ilc 'printenv $v'" 2>/dev/null | tail -1)
+    [[ -n "$val" ]] || continue
+    add_env "export $v=$(printf '%q' "$val")"; chmod 600 "$ENV_FILE"
+    export "$v=$val"; info "env $v (from the Mac's login shell)"
+  done
+}
+
+node_install() { # run in the repo folder
+  if [[ -f .yarnrc.yml ]]; then corepack enable >/dev/null 2>&1; yarn install --immutable
+  elif [[ -f yarn.lock ]]; then yarn install --frozen-lockfile --non-interactive
+  elif [[ -f pnpm-lock.yaml ]]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile
+  elif [[ -f package-lock.json ]]; then npm ci
+  else npm install; fi
+}
+
+# Old node-gyp (bundled with old Node versions) can't run on Python 3.11+.
+old_python() {
+  command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
+  uv python install 3.10 >/dev/null 2>&1 && uv python find 3.10
+}
+
 if want deps; then
   step "Dependencies (logs in $LOGS)"
   load_nvm
-  for name in "${NAMES[@]}"; do
-    dst="$DEST/$name"; [[ -d "$dst" ]] || continue
+  command -v mac >/dev/null && import_mac_env
+  for i in "${!NAMES[@]}"; do
+    name=${NAMES[i]}; src=${SRCS[i]}; dst="$DEST/$name"; [[ -d "$dst" ]] || continue
     if [[ -f "$dst/composer.json" ]] && command -v composer >/dev/null; then
       # Start from the Mac's vendor/ (PHP is portable). Composer then only fetches
       # what differs, so private packages the Mac already has need no GitHub access.
-      src=${SRCS[$(for j in "${!NAMES[@]}"; do [[ "${NAMES[j]}" == "$name" ]] && echo "$j"; done)]}
       if [[ -d "$src/vendor" && ! -f "$dst/vendor/composer/installed.json" ]]; then
         rsync -a "$src/vendor/" "$dst/vendor/" && info "$name: vendor/ seeded from the Mac"
       fi
-      (cd "$dst" && composer install -n --no-progress >"$LOGS/$name-composer.log" 2>&1) &&
-        info "$name: composer ok" || { FAILED+=("$name composer ($LOGS/$name-composer.log)"); warn "$name: composer failed"; }
+      # PHP version and extensions are the containers' business; this only fetches the code.
+      if (cd "$dst" && composer install -n --no-progress --ignore-platform-reqs >"$LOGS/$name-composer.log" 2>&1); then
+        info "$name: composer ok"
+      elif [[ -f "$dst/vendor/composer/installed.json" ]]; then
+        warn "$name: composer failed, vendor/ is the Mac's copy ($LOGS/$name-composer.log)"
+      else
+        FAILED+=("$name composer ($LOGS/$name-composer.log)"); warn "$name: composer failed"
+      fi
     fi
     if [[ -f "$dst/package.json" ]] && command -v nvm >/dev/null; then
-      (
-        cd "$dst" || exit 1
-        if [[ -f .nvmrc ]]; then nvm use >/dev/null 2>&1 || nvm install >/dev/null 2>&1; else nvm use default >/dev/null 2>&1; fi
-        if [[ -f .yarnrc.yml ]]; then corepack enable >/dev/null 2>&1; yarn install --immutable
-        elif [[ -f yarn.lock ]]; then yarn install --frozen-lockfile --non-interactive
-        elif [[ -f pnpm-lock.yaml ]]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile
-        elif [[ -f package-lock.json ]]; then npm ci
-        else npm install; fi
-      ) >"$LOGS/$name-node.log" 2>&1 &&
-        info "$name: node ok" || { FAILED+=("$name node ($LOGS/$name-node.log)"); warn "$name: node deps failed"; }
+      ( cd "$dst" || exit 1
+        if [[ -f .nvmrc ]]; then nvm use >/dev/null 2>&1 || { nvm install >/dev/null 2>&1 && nvm use >/dev/null 2>&1; }; else nvm use default >/dev/null 2>&1; fi
+        node_install ) >"$LOGS/$name-node.log" 2>&1
+      rc=$?
+      # Native modules written for older toolchains: old node-gyp can't run on
+      # Python 3.11+, and newer GCC no longer pulls in <cstdint> implicitly.
+      if ((rc)) && grep -qE "invalid mode: 'rU'|couldn't be built|gyp ERR" "$LOGS/$name-node.log"; then
+        info "$name: retrying native builds with older-toolchain settings"
+        py=""; grep -q "invalid mode: 'rU'" "$LOGS/$name-node.log" && py=$(old_python)
+        ( cd "$dst" || exit 1
+          if [[ -f .nvmrc ]]; then nvm use >/dev/null 2>&1; else nvm use default >/dev/null 2>&1; fi
+          [[ -n "$py" ]] && export npm_config_python="$py" PYTHON="$py"
+          export CXXFLAGS="${CXXFLAGS:-} -include cstdint"
+          node_install ) >"$LOGS/$name-node.log" 2>&1
+        rc=$?
+      fi
+      if ((rc)); then FAILED+=("$name node ($LOGS/$name-node.log)"); warn "$name: node deps failed"
+      else info "$name: node ok"; fi
     fi
   done
 fi
