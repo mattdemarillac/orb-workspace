@@ -12,23 +12,22 @@ by that: does it make the machine behave like the Mac?
 
 - `orb-workspace`: the whole tool, one bash script. No dependencies on the Mac
   besides OrbStack's `orb` CLI.
-- `README.md`: user docs. Keep the step table and options list in step with the
-  script's `usage()`.
+- `README.md`: user docs. Keep "What it does" in step with the script.
 
 ## How the script runs
 
 The script runs twice:
 
-1. **On the Mac** (no `__vm` first argument). Makes `--share`, `--hook` and
-   `--folder NAME=DIR` paths absolute, creates the OrbStack machine if missing,
-   then `exec`s itself inside the machine:
-   `orb -m <machine> env … bash /mnt/mac<path of script> __vm <args>`.
-2. **In the machine** (`__vm`). Does the real work. `HOST_HOME` and `MACHINE`
-   come from the Mac side.
+1. **On the Mac** (no `__vm` first argument). Takes only the machine name,
+   creates the OrbStack machine if missing, then `exec`s itself inside it:
+   `orb -m <machine> env … bash /mnt/mac<path of script> __vm`.
+2. **In the machine** (`__vm`). Does the real work, top to bottom: Claude
+   Code, folders, Mac tools, hosts, Claude config, summary. `HOST_HOME` and
+   `MACHINE` come from the Mac side.
 
-Steps run in this order: `toolchain`, `folders`, `shares`, `mac`, `hosts`,
-`claude`, hook, summary. `want <step>` decides if a step runs: all steps when
-none are named, otherwise only the named ones.
+There are no options or step flags: a full run is quick and idempotent. Keep it
+that way; settings that might change (bridged commands, linked folders) are
+variables at the top of the script.
 
 ## Rules
 
@@ -37,8 +36,8 @@ none are named, otherwise only the named ones.
   the Mac. Duplicates drift, and edits made in the machine must show on the Mac.
 - **Mac side must stay bash 3.2 compatible** (macOS `/bin/bash`): no
   associative arrays, `mapfile`, `${x,,}` or `declare -n` above the `__vm`
-  line. Guard empty arrays with `${ARR[@]+"${ARR[@]}"}`. Don't put a heredoc
-  inside `$( … )`: bash 3.2 can fail to parse the whole file.
+  line. Don't put a heredoc inside `$( … )`: bash 3.2 can fail to parse the
+  whole file.
 - **Every step must be idempotent.** Re-running on a finished machine must
   change nothing. Never delete the user's files: move them aside.
 - **OrbStack's `mac`** rewrites absolute args that exist in Linux
@@ -65,7 +64,6 @@ There are no automated tests. Before committing:
 
 ```bash
 bash -n orb-workspace                     # syntax (Mac bash 3.2)
-orb-workspace <machine> --dry-run
 ```
 
 For anything that changes a step, test on a throwaway machine, check the

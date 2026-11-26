@@ -27,31 +27,29 @@ Put `~/bin` on your `PATH`, or run the script by its full path. Needs OrbStack
 
 ## What it does
 
-Every step can be re-run safely. With no step flags it runs all of them in
-this order; name steps to run only those.
+One command, no options. Every run does all of this and is safe to repeat:
 
-| Step | What happens in the machine |
-|---|---|
-| `--toolchain` | the few packages Claude Code needs (curl, jq, rsync, ripgrep), Claude Code itself, your global `~/.claude/CLAUDE.md` |
-| `--folders` | `~/.claude`, `~/.config`, `~/.cache`, `~/.local/bin`, `~/tmp` (as `TMPDIR`), `~/Downloads`, `~/Documents`, `~/Desktop`, XDG user dirs |
-| `--shares` | links each `--share` folder (default `~/Sites`) into the machine's home. OrbStack mounts the Mac at the same paths (`/Users/...`), so both Claudes edit the same files, live. Anything already at that name in the machine is moved aside, not deleted |
-| `--mac` | wrappers in `~/.local/bin` so `git`, `gh`, `node`, `npm`, `npx`, `yarn`, `pnpm`, `php`, `composer`, `docker`, `xcodebuild`, `xcrun`, `adb`, `emulator`, ... run on the Mac, in the same folder, with the shell's env vars. Node follows the project's `.nvmrc`. `mac-run <cmd>` runs anything else on the Mac. Also writes a section into the machine's `~/.claude/CLAUDE.md` that explains this to the agent |
-| `--hosts` | the Mac's local hostnames (its `/etc/hosts` entries for `127.0.0.1`/`::1`) point at the Mac, so local sites and HTTP MCP servers resolve the same |
-| `--claude` | copies the Mac's Claude Code setup: `settings.json`, hooks, plugins, skills, agents, commands, MCP servers, and per-project MCP servers for projects in the shared folders. Hooks and stdio MCP servers run on the Mac. Login, history and memory are not copied |
-| `--hook FILE` | runs your own bash script inside the machine at the end |
+- **Claude Code:** installs it in the machine with the few packages it needs
+  (curl, jq, rsync, ripgrep).
+- **Folders:** links `~/Sites`, `~/Downloads`, `~/Documents` and `~/Desktop` to
+  the Mac's. OrbStack mounts the Mac at the same paths (`/Users/...`), so both
+  Claudes edit the same files, live. Anything already at those names in the
+  machine is moved aside, never deleted.
+- **Mac tools:** wrappers in `~/.local/bin` so `git`, `gh`, `node`, `npm`,
+  `npx`, `yarn`, `pnpm`, `php`, `composer`, `docker`, `curl`, `xcodebuild`,
+  `xcrun`, `adb`, `emulator`, ... run on the Mac, in the same folder, with the
+  shell's env vars. Node follows the project's `.nvmrc`. `mac-run <cmd>` runs
+  anything else on the Mac. To bridge more commands by name, add them to
+  `MAC_CMDS` at the top of the script.
+- **Hosts:** the Mac's local hostnames (its `/etc/hosts` entries for
+  `127.0.0.1`/`::1`) point at the Mac.
+- **Claude config:** copies the Mac's `settings.json`, hooks, plugins, skills,
+  agents, commands, MCP servers and per-project MCP servers. Hooks and stdio
+  MCP servers run on the Mac; HTTP ones on `localhost` point at the Mac. Login,
+  history and memory are not copied. A section in the machine's
+  `~/.claude/CLAUDE.md` explains the setup to the agent.
 
 Restart a Claude session that is already running in the machine after a run.
-
-## Options
-
-```
---share DIR          Mac folder to work in (repeatable, default ~/Sites)
---folder NAME[=DIR]  home folder in the machine; NAME=DIR links it to a Mac folder
---mac-cmd NAME       extra Mac command to run by name (repeatable)
---hook FILE          your own script, run in the machine at the end
---distro NAME        distro for a new machine (default ubuntu)
---dry-run            show what would be done, change nothing
-```
 
 ## How it works
 

@@ -3,128 +3,54 @@
 # OrbStack Linux machine that otherwise behaves exactly like the Mac: same
 # files, same tools, same Docker, same Claude config. Safe to re-run.
 #
+# Usage: orb-workspace <machine>
+#
 # The script runs on the Mac to create the machine, then re-runs itself inside
 # the machine (the Mac filesystem is visible there under /mnt/mac and /Users).
 set -uo pipefail
 
-usage() {
-  cat <<'EOF'
-Usage: orb-workspace <machine> [options]
-
-Creates (or updates) an OrbStack Linux machine that runs its own Claude Code
-login and otherwise matches the Mac: it works on the Mac's folders, and its
-commands (git, gh, node, php, docker, Xcode, ...) run on the Mac.
-
-Steps (default: all of them; naming any step runs only the named ones)
-  --toolchain        apt basics, Claude Code, your global ~/.claude/CLAUDE.md
-  --folders          home folders: ~/.claude, ~/.config, ~/.cache, ~/.local/bin,
-                     ~/tmp (TMPDIR), XDG user dirs, plus the --folder list
-  --shares           link each --share folder into the machine's home, so both
-                     sides edit the same files at the same paths
-  --mac              run Mac tools from the machine by name: wrappers in
-                     ~/.local/bin that run them on the Mac through OrbStack's
-                     `mac`, with this shell's env vars and the right Node
-  --hosts            point the Mac's /etc/hosts local names at the Mac
-  --claude           copy the Mac's Claude Code setup: settings, hooks, plugins,
-                     skills, MCP servers, per-project MCP servers (hooks and MCP
-                     servers run on the Mac); not login, history or memory
-
-Options
-  --share DIR        Mac folder to work in (repeatable, default ~/Sites)
-  --folder NAME[=MACDIR]
-                     home folder in the machine (repeatable). NAME alone is a
-                     machine-only folder; NAME=MACDIR links it to a Mac folder.
-                     Default: Downloads Documents Desktop, machine-only
-  --mac-cmd NAME     extra Mac command to run by name (repeatable)
-  --hook FILE        bash script run inside the machine at the end
-  --distro NAME      distro for a new machine (default ubuntu)
-  --dry-run          show what would be done, change nothing
-  -h, --help
-
-Example
-  orb-workspace work
-  orb -m work            # then: cd ~/Sites/<repo> && claude
-EOF
-}
-
 # Mac commands that run on the Mac when called by name in the machine.
-DEFAULT_MAC_CMDS="git gh node npm npx yarn pnpm corepack php composer docker docker-compose
+# Anything else: mac-run <command>.
+MAC_CMDS="git gh node npm npx yarn pnpm corepack php composer docker docker-compose
   xcodebuild xcrun xcode-select swift pod fastlane adb emulator sdkmanager avdmanager
   studio phpstorm curl wget mysql psql redis-cli"
+
+# Mac home folders linked into the machine's home.
+MAC_FOLDERS="Sites Downloads Documents Desktop"
+
+usage() {
+  cat <<'EOF'
+Usage: orb-workspace <machine>
+
+Creates (or updates) an OrbStack Linux machine that runs its own Claude Code
+login and otherwise matches the Mac: it works on the Mac's files, its commands
+(git, gh, node, php, docker, Xcode, ...) run on the Mac, and it has the Mac's
+Claude settings, hooks, plugins, skills and MCP servers. Safe to re-run.
+
+Then: orb -m <machine>, cd ~/Sites/<repo> && claude
+EOF
+}
 
 # --------------------------------------------------------------------------
 # Mac side: create the machine, then re-run this script inside it.
 # --------------------------------------------------------------------------
 if [[ "${1:-}" != "__vm" ]]; then
-  if [[ $# -eq 0 || "$1" == "-h" || "$1" == "--help" ]]; then usage; exit 0; fi
+  if [[ $# -ne 1 || "$1" == -* ]]; then usage; [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; exit; fi
   command -v orb >/dev/null || { echo "orb (OrbStack CLI) not found" >&2; exit 1; }
-  [[ "$1" == -* ]] && { echo "First argument must be the machine name" >&2; exit 1; }
-
-  MACHINE=$1; shift
+  MACHINE=$1
   SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
-  DISTRO=ubuntu; DRY=0; ARGS=()
-
-  abspath() { # absolute Mac path, ~ expanded; fails if missing
-    local p=$1; [[ "$p" == "~"* ]] && p="$HOME${p#\~}"
-    if [[ -d "$p" ]]; then (cd "$p" && pwd)
-    elif [[ -f "$p" ]]; then echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
-    else return 1; fi
-  }
-
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --share|--hook)
-        [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }
-        p=$(abspath "$2") || { echo "$1: $2 not found" >&2; exit 1; }
-        ARGS+=("$1" "$p"); shift 2 ;;
-      --folder)
-        [[ $# -ge 2 ]] || { echo "--folder needs a value" >&2; exit 1; }
-        v=$2
-        if [[ "$v" == *=* ]]; then
-          p=$(abspath "${v#*=}") || { echo "--folder: Mac folder ${v#*=} not found" >&2; exit 1; }
-          v="${v%%=*}=$p"
-        fi
-        ARGS+=(--folder "$v"); shift 2 ;;
-      --distro) DISTRO=${2:?}; shift 2 ;;
-      --dry-run) DRY=1; ARGS+=("$1"); shift ;;
-      *) ARGS+=("$1"); shift ;;
-    esac
-  done
-
   if ! orb list 2>/dev/null | awk '{print $1}' | grep -qx "$MACHINE"; then
-    if [[ $DRY == 1 ]]; then echo "Machine '$MACHINE' does not exist; it would be created ($DISTRO)."; exit 0; fi
-    echo "==> Creating OrbStack machine '$MACHINE' ($DISTRO)"
-    orb create "$DISTRO" "$MACHINE" || exit 1
+    echo "==> Creating OrbStack machine '$MACHINE'"
+    orb create ubuntu "$MACHINE" || exit 1
   fi
-
-  exec orb -m "$MACHINE" env MACHINE="$MACHINE" HOST_HOME="$HOME" \
-    bash "/mnt/mac$SELF" __vm ${ARGS[@]+"${ARGS[@]}"}
+  exec orb -m "$MACHINE" env MACHINE="$MACHINE" HOST_HOME="$HOME" bash "/mnt/mac$SELF" __vm
 fi
 
 # --------------------------------------------------------------------------
 # Machine side.
 # --------------------------------------------------------------------------
-shift # __vm
-SHARES=(); FOLDERS=(); MAC_EXTRA=(); STEPS=""; HOOK=""; DRY=0
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --share) SHARES+=("$2"); shift 2 ;;
-    --folder) FOLDERS+=("$2"); shift 2 ;;
-    --mac-cmd) MAC_EXTRA+=("$2"); shift 2 ;;
-    --hook) HOOK=$2; shift 2 ;;
-    --dry-run) DRY=1; shift ;;
-    --toolchain|--folders|--shares|--mac|--hosts|--claude) STEPS+=" ${1#--}"; shift ;;
-    -h|--help) usage; exit 0 ;;
-    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
-  esac
-done
-((${#SHARES[@]})) || SHARES=("$HOST_HOME/Sites")
-
 LOGS="$HOME/.cache/orb-workspace"; mkdir -p "$LOGS"
-FAILED=(); NOTES=()
-
-want() { [[ -z "$STEPS" || " $STEPS " == *" $1 "* ]]; }
+FAILED=()
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '    \033[33m! %s\033[0m\n' "$*"; }
@@ -142,94 +68,50 @@ add_env() { # add_env 'export X=...'
   fi
 }
 
-step "Machine '$MACHINE'"
-info "shares: ${SHARES[*]}"
-info "steps: ${STEPS:- toolchain folders shares mac hosts claude}${HOOK:+ hook}"
-[[ $DRY == 1 ]] && exit 0
-
-# --- toolchain -------------------------------------------------------------
-if want toolchain; then
-  step "Toolchain"
-  # Only what Claude Code itself needs here; project tools run on the Mac.
-  if ! command -v jq >/dev/null || ! command -v rsync >/dev/null || ! command -v curl >/dev/null || ! command -v rg >/dev/null; then
-    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq rsync ripgrep >"$LOGS/apt.log" 2>&1 ||
-      { FAILED+=("apt install (see $LOGS/apt.log)"); warn "apt install failed"; }
-  fi
-  if [[ ! -x "$HOME/.local/bin/claude" ]]; then
-    info "installing Claude Code"
-    curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || FAILED+=("Claude Code install")
-  fi
-  add_env 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
-  if [[ -f "/mnt/mac$HOST_HOME/.claude/CLAUDE.md" && ! -f "$HOME/.claude/CLAUDE.md" ]]; then
-    mkdir -p "$HOME/.claude" && cp "/mnt/mac$HOST_HOME/.claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
-    info "copied your global CLAUDE.md"
-  fi
-  info "$("$HOME/.local/bin/claude" --version 2>/dev/null || echo 'Claude Code missing')"
+# --- Claude Code -----------------------------------------------------------
+step "Claude Code"
+# Only what Claude Code itself needs here; project tools run on the Mac.
+if ! command -v jq >/dev/null || ! command -v rsync >/dev/null || ! command -v rg >/dev/null; then
+  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq rsync ripgrep >"$LOGS/apt.log" 2>&1 ||
+    { FAILED+=("apt install (see $LOGS/apt.log)"); warn "apt install failed"; }
 fi
+if [[ ! -x "$HOME/.local/bin/claude" ]]; then
+  info "installing"
+  /usr/bin/curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || FAILED+=("Claude Code install")
+fi
+mkdir -p "$HOME/.claude" "$HOME/.local/bin" "$HOME/tmp"; chmod 700 "$HOME/tmp"
+add_env 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
+add_env 'export TMPDIR="$HOME/tmp"'
+info "$("$HOME/.local/bin/claude" --version 2>/dev/null || echo 'missing')"
 
 # --- folders ---------------------------------------------------------------
-if want folders; then
-  step "Home folders"
-  mkdir -p "$HOME/.claude" "$HOME/.config" "$HOME/.cache" "$HOME/.local/bin" "$HOME/.local/share" "$HOME/tmp"
-  chmod 700 "$HOME/tmp"
-  add_env 'export TMPDIR="$HOME/tmp"'
-  info "~/.claude ~/.config ~/.cache ~/.local/bin ~/tmp (TMPDIR)"
-
-  ((${#FOLDERS[@]})) || FOLDERS=(Downloads Documents Desktop)
-  for f in "${FOLDERS[@]}"; do
-    n=${f%%=*}; p="$HOME/$n"
-    if [[ "$f" == *=* ]]; then
-      t="${f#*=}"
-      if [[ -L "$p" && "$(readlink "$p")" == "$t" ]]; then info "~/$n -> Mac $t"; continue; fi
-      if [[ -L "$p" ]]; then rm "$p"
-      elif [[ -d "$p" ]]; then rmdir "$p" 2>/dev/null || { warn "~/$n has files in it; not linking it to $t"; continue; }
-      fi
-      ln -s "$t" "$p" && info "~/$n -> Mac $t"
-    else
-      if [[ -L "$p" ]]; then warn "~/$n links to $(readlink "$p"); leaving it"; continue; fi
-      mkdir -p "$p" && info "~/$n (on the Mac: ~/OrbStack/$MACHINE$p)"
-    fi
-  done
-
-  ud="$HOME/.config/user-dirs.dirs"
-  for pair in DOWNLOAD:Downloads DOCUMENTS:Documents DESKTOP:Desktop; do
-    k=${pair%%:*}; n=${pair#*:}
-    [[ -e "$HOME/$n" ]] || continue
-    grep -q "^XDG_${k}_DIR=" "$ud" 2>/dev/null || echo "XDG_${k}_DIR=\"\$HOME/$n\"" >>"$ud"
-  done
-fi
-
-# --- shares ----------------------------------------------------------------
-# The Mac's folders are mounted here at the same path (/Users/...). Working
-# there means both Claudes edit the same files and every path means the same.
-if want shares; then
-  step "Shared folders"
-  for s in "${SHARES[@]}"; do
-    [[ -d "$s" ]] || { warn "$s is not visible in the machine"; continue; }
-    p="$HOME/$(basename "$s")"
-    if [[ -L "$p" && "$(readlink "$p")" == "$s" ]]; then info "~/$(basename "$s") -> $s"; continue; fi
-    if [[ -e "$p" && ! -L "$p" ]]; then
-      # Keep anything that was here, but out of the way.
-      aside="$p.vm-copy-$(date +%Y%m%d%H%M%S)"
-      mv "$p" "$aside" && warn "moved the machine's own ~/$(basename "$s") aside to $aside"
-    fi
-    rm -f "$p"; ln -s "$s" "$p" && info "~/$(basename "$s") -> $s (the Mac's folder)"
-  done
-fi
+# The Mac's files are mounted here at the same paths (/Users/...). Link the
+# usual home folders to them so both Claudes use the same files.
+step "Folders"
+for n in $MAC_FOLDERS; do
+  t="$HOST_HOME/$n"; p="$HOME/$n"
+  [[ -d "$t" ]] || continue
+  if [[ -L "$p" && "$(readlink "$p")" == "$t" ]]; then info "~/$n -> $t"; continue; fi
+  if [[ -L "$p" ]]; then rm "$p"
+  elif [[ -d "$p" ]] && ! rmdir "$p" 2>/dev/null; then
+    aside="$p.vm-copy-$(date +%Y%m%d%H%M%S)" # never delete: move it out of the way
+    mv "$p" "$aside" && warn "moved the machine's own ~/$n aside to $aside"
+  fi
+  ln -s "$t" "$p" && info "~/$n -> $t"
+done
 
 # --- mac tools -------------------------------------------------------------
 WRAP_MARK="# orb-workspace: macOS bridge"
-if want mac; then
-  step "Mac tools"
-  if ! command -v mac >/dev/null; then
-    warn "OrbStack's 'mac' command is missing in this machine; skipping"
-  else
-    mkdir -p "$HOME/.local/bin"
-    # mac-run: run a command on the Mac in the same folder. `mac` passes no env
-    # vars, so this forwards the shell's own ones; Node follows the project's
-    # .nvmrc the way the Mac's shell does.
-    cat >"$HOME/.local/bin/mac-run" <<'RUN'
+step "Mac tools"
+if ! command -v mac >/dev/null; then
+  warn "OrbStack's 'mac' command is missing in this machine"; FAILED+=("mac bridge")
+  BRIDGED=()
+else
+  # mac-run: run a command on the Mac in the same folder. `mac` passes no env
+  # vars, so this forwards the shell's own ones; Node is picked the way a Mac
+  # shell picks it.
+  cat >"$HOME/.local/bin/mac-run" <<'RUN'
 #!/bin/bash
 # orb-workspace: macOS bridge
 # Usage: mac-run <command> [args...]  -- runs it on the Mac, in this folder.
@@ -256,84 +138,73 @@ case "$cmd" in
 esac
 exec mac env ${envs[@]+"${envs[@]}"} "$cmd" "$@"
 RUN
-    chmod +x "$HOME/.local/bin/mac-run"
+  chmod +x "$HOME/.local/bin/mac-run"
 
-    BRIDGED=()
-    for c in $DEFAULT_MAC_CMDS ${MAC_EXTRA[@]+"${MAC_EXTRA[@]}"}; do
-      w="$HOME/.local/bin/$c"
-      if [[ -f "$w" ]] && ! grep -qF "$WRAP_MARK" "$w"; then continue; fi # not ours
-      target=""
-      if mac sh -lc "command -v '$c'" >/dev/null 2>&1; then target=$c
-      else
-        for d in platform-tools emulator cmdline-tools/latest/bin; do
-          [[ -x "$HOST_HOME/Library/Android/sdk/$d/$c" ]] && { target="$HOST_HOME/Library/Android/sdk/$d/$c"; break; }
-        done
-      fi
-      if [[ -z "$target" ]]; then rm -f "$w"; continue; fi
-      printf '#!/bin/sh\n%s\nexec mac-run %q "$@"\n' "$WRAP_MARK" "$target" >"$w" && chmod +x "$w"
-      BRIDGED+=("$c")
-    done
-    rm -f "$HOME/.local/bin/docker-mac" # docker itself is the Mac's now
-    # Interactive shells may put other tools (nvm, ...) ahead of these later in
-    # .bashrc; put the bridged commands back in front at the very end.
-    mark='# orb-workspace: bridged Mac commands first'
-    grep -qxF "$mark" "$HOME/.bashrc" 2>/dev/null ||
-      printf '\n%s\nexport PATH="$HOME/.local/bin:$PATH"\n' "$mark" >>"$HOME/.bashrc"
-    hash -r
-    info "run on the Mac: ${BRIDGED[*]:-nothing found}"
-
-    # Tell agents in this machine how their environment works.
-    cm="$HOME/.claude/CLAUDE.md"; mkdir -p "$HOME/.claude"; touch "$cm"
-    cat >"$cm.block" <<EOF
-<!-- orb-workspace:start (generated, re-written on each run) -->
-# Environment: OrbStack machine "$MACHINE"
-
-You run inside an OrbStack Linux machine on the user's Mac. It exists only so a
-second Claude can run with its own login; everything else is the Mac's.
-
-- **Files:** work in the Mac's folders (\`${SHARES[*]}\`, also at \`~/$(basename "${SHARES[0]}")\`).
-  They are the same files the user and the Mac's Claude see, live.
-- **Commands run on the Mac:** ${BRIDGED[*]:-none}. They run in the same folder
-  with this shell's env vars, and Node follows the project's \`.nvmrc\`. Run any
-  other Mac command with \`mac-run <command>\`. Docker is the Mac's Docker.
-- **Networking:** the Mac's local hostnames from /etc/hosts point at the Mac,
-  and the Mac is \`host.orb.internal\`. \`localhost\` here is this machine.
-- **Temp files:** \`\$TMPDIR\` is \`~/tmp\` in this machine.
-<!-- orb-workspace:end -->
-EOF
-    awk '/<!-- orb-workspace:start/{skip=1} !skip{print} /<!-- orb-workspace:end -->/{skip=0}' "$cm" >"$cm.tmp"
-    sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$cm.tmp" >"$cm" && rm -f "$cm.tmp"
-    [[ -s "$cm" ]] && printf '\n' >>"$cm"
-    cat "$cm.block" >>"$cm" && rm -f "$cm.block"
-    info "environment notes in ~/.claude/CLAUDE.md"
-  fi
+  BRIDGED=()
+  for c in $MAC_CMDS; do
+    w="$HOME/.local/bin/$c"
+    if [[ -f "$w" ]] && ! grep -qF "$WRAP_MARK" "$w"; then continue; fi # not ours
+    target=""
+    if mac sh -lc "command -v '$c'" >/dev/null 2>&1; then target=$c
+    else
+      for d in platform-tools emulator cmdline-tools/latest/bin; do
+        [[ -x "$HOST_HOME/Library/Android/sdk/$d/$c" ]] && { target="$HOST_HOME/Library/Android/sdk/$d/$c"; break; }
+      done
+    fi
+    if [[ -z "$target" ]]; then rm -f "$w"; continue; fi
+    printf '#!/bin/sh\n%s\nexec mac-run %q "$@"\n' "$WRAP_MARK" "$target" >"$w" && chmod +x "$w"
+    BRIDGED+=("$c")
+  done
+  rm -f "$HOME/.local/bin/docker-mac" # from older versions
+  # Interactive shells may put other tools (nvm, ...) ahead of these later in
+  # .bashrc; put the bridged commands back in front at the very end.
+  mark='# orb-workspace: bridged Mac commands first'
+  grep -qxF "$mark" "$HOME/.bashrc" 2>/dev/null ||
+    printf '\n%s\nexport PATH="$HOME/.local/bin:$PATH"\n' "$mark" >>"$HOME/.bashrc"
+  info "run on the Mac: ${BRIDGED[*]:-nothing found}"
 fi
 
 # --- hosts -----------------------------------------------------------------
-if want hosts; then
-  step "Hosts"
-  mac_ip=$(getent ahostsv4 host.orb.internal | awk 'NR==1{print $1}')
-  if [[ -z "$mac_ip" || ! -f /mnt/mac/private/etc/hosts ]]; then
-    warn "can't find the Mac (host.orb.internal) or its /etc/hosts; skipping"
-  else
-    names=$(awk '$1 ~ /^(127\.0\.0\.1|::1)$/ {for (i=2;i<=NF;i++) { if ($i ~ /^#/) break; if ($i != "localhost") print $i }}' \
-      /mnt/mac/private/etc/hosts | sort -u)
-    {
-      sed '/# orb-workspace:start/,/# orb-workspace:end/d' /etc/hosts |
-        awk -v names=" $(tr '\n' ' ' <<<"$names")" '
-          # drop plain local entries for these names: here they must point at the Mac
-          $1 == "127.0.0.1" && NF == 2 && index(names, " " $2 " ") { next } { print }'
-      echo "# orb-workspace:start (the Mac's local names point at the Mac)"
-      for n in $names; do printf '%s\t%s\n' "$mac_ip" "$n"; done
-      echo "# orb-workspace:end"
-    } >"$LOGS/hosts.new" && sudo cp "$LOGS/hosts.new" /etc/hosts
-    info "$(wc -w <<<"$names" | tr -d ' ') name(s) -> $mac_ip (the Mac)"
-  fi
+# localhost here is this machine, so the Mac's local names must point at the Mac.
+step "Hosts"
+mac_ip=$(getent ahostsv4 host.orb.internal | awk 'NR==1{print $1}')
+if [[ -z "$mac_ip" || ! -f /mnt/mac/private/etc/hosts ]]; then
+  warn "can't find the Mac (host.orb.internal) or its /etc/hosts"; FAILED+=("hosts")
+else
+  names=$(awk '$1 ~ /^(127\.0\.0\.1|::1)$/ {for (i=2;i<=NF;i++) { if ($i ~ /^#/) break; if ($i != "localhost") print $i }}' \
+    /mnt/mac/private/etc/hosts | sort -u)
+  {
+    sed '/# orb-workspace:start/,/# orb-workspace:end/d' /etc/hosts |
+      awk -v names=" $(tr '\n' ' ' <<<"$names")" '$1 == "127.0.0.1" && NF == 2 && index(names, " " $2 " ") { next } { print }'
+    echo "# orb-workspace:start (the Mac's local names point at the Mac)"
+    for n in $names; do printf '%s\t%s\n' "$mac_ip" "$n"; done
+    echo "# orb-workspace:end"
+  } >"$LOGS/hosts.new"
+  cmp -s "$LOGS/hosts.new" /etc/hosts || sudo cp "$LOGS/hosts.new" /etc/hosts
+  info "$(wc -w <<<"$names" | tr -d ' ') name(s) -> $mac_ip (the Mac)"
 fi
 
 # --- claude config ---------------------------------------------------------
 # Same Claude Code setup as the Mac; only the login, history and memory differ.
 # Hooks and stdio MCP servers run on the Mac, so they behave exactly as there.
+step "Claude config (same as the Mac, separate login)"
+MC="/mnt/mac$HOST_HOME/.claude"; VC="$HOME/.claude"
+
+if [[ -f "$MC/settings.json" ]]; then
+  jq '(.hooks // {}) |= with_entries(.value |= map(.hooks |= map(
+        if .type == "command" and (.command | startswith("mac ") | not) then .command = "mac sh -c " + (.command | @sh) else . end)))
+      | if .hooks == {} then del(.hooks) else . end' "$MC/settings.json" >"$VC/settings.json" && info "settings.json, hooks"
+fi
+[[ -f "$MC/CLAUDE.md" && ! -f "$VC/CLAUDE.md" ]] && cp "$MC/CLAUDE.md" "$VC/CLAUDE.md" && info "CLAUDE.md"
+for d in skills agents commands output-styles; do
+  [[ -d "$MC/$d" ]] && rsync -a "$MC/$d/" "$VC/$d/" && info "$d/"
+done
+if [[ -d "$MC/plugins" ]]; then
+  rsync -a "$MC/plugins/" "$VC/plugins/"
+  find "$VC/plugins" -maxdepth 1 -name '*.json' -exec sed -i "s#$HOST_HOME/.claude#$HOME/.claude#g" {} +
+  info "plugins/"
+fi
+
 BRIDGE_JQ='def bridge:
   if (.type // "stdio") == "stdio" and .command != "mac" then
     # One quoted shell string: `mac` would rewrite separate absolute-path args
@@ -345,54 +216,49 @@ BRIDGE_JQ='def bridge:
   elif (.url // "") | test("^https?://(localhost|127\\.0\\.0\\.1)[:/]") then
     .url |= sub("^(?<s>https?://)(localhost|127\\.0\\.0\\.1)"; "\(.s)host.orb.internal")
   else . end;'
-
-if want claude; then
-  step "Claude Code config (same as the Mac, separate login)"
-  MC="/mnt/mac$HOST_HOME/.claude"; VC="$HOME/.claude"; mkdir -p "$VC"
-
-  if [[ -f "$MC/settings.json" ]]; then
-    [[ -f "$VC/settings.json" && ! -f "$VC/settings.json.orb-workspace-bak" ]] && cp "$VC/settings.json" "$VC/settings.json.orb-workspace-bak"
-    jq '(.hooks // {}) |= with_entries(.value |= map(.hooks |= map(
-          if .type == "command" and (.command | startswith("mac ") | not) then .command = "mac sh -c " + (.command | @sh) else . end)))
-        | if .hooks == {} then del(.hooks) else . end' "$MC/settings.json" >"$VC/settings.json" && info "settings.json (hooks run on the Mac)"
-  fi
-
-  for d in skills agents commands output-styles; do
-    [[ -d "$MC/$d" ]] && rsync -a "$MC/$d/" "$VC/$d/" && info "$d/"
-  done
-  if [[ -d "$MC/plugins" ]]; then
-    rsync -a "$MC/plugins/" "$VC/plugins/"
-    find "$VC/plugins" -maxdepth 1 -name '*.json' -exec sed -i "s#$HOST_HOME/.claude#$HOME/.claude#g" {} +
-    info "plugins/"
-  fi
-
-  if [[ -f "/mnt/mac$HOST_HOME/.claude.json" ]]; then
-    [[ -f "$HOME/.claude.json" ]] || echo '{}' >"$HOME/.claude.json"
-    # Projects keep their Mac paths here, so per-project MCP servers copy across as they are.
-    shares=$(printf '%s\n' "${SHARES[@]}" | jq -R . | jq -s .)
-    jq --argjson shares "$shares" --slurpfile mac "/mnt/mac$HOST_HOME/.claude.json" "$BRIDGE_JQ"'
-      .mcpServers = ((.mcpServers // {}) + (($mac[0].mcpServers // {}) | map_values(bridge)))
-      | reduce (($mac[0].projects // {}) | to_entries[]
-                | select(.key as $k | any($shares[] as $s | ($k == $s or ($k | startswith($s + "/"))); .))
-                | select((.value.mcpServers // {}) != {})) as $p (.;
-          .projects[$p.key].mcpServers = ((.projects[$p.key].mcpServers // {}) + ($p.value.mcpServers | map_values(bridge))))' \
-      "$HOME/.claude.json" >"$HOME/.claude.json.tmp" && mv "$HOME/.claude.json.tmp" "$HOME/.claude.json" &&
-      info "MCP servers: $(jq -r '.mcpServers | keys | join(" ")' "$HOME/.claude.json")" &&
-      info "per-project MCP servers: $(jq -r '[.projects // {} | to_entries[] | select((.value.mcpServers // {}) != {}) | .key] | join(" ")' "$HOME/.claude.json")"
-  fi
-  NOTES+=("Restart any Claude Code session already running in the machine to pick up the config.")
+if [[ -f "/mnt/mac$HOST_HOME/.claude.json" ]]; then
+  [[ -f "$HOME/.claude.json" ]] || echo '{}' >"$HOME/.claude.json"
+  # Projects have the same paths here, so per-project MCP servers copy across as they are.
+  jq --slurpfile mac "/mnt/mac$HOST_HOME/.claude.json" "$BRIDGE_JQ"'
+    .mcpServers = ((.mcpServers // {}) + (($mac[0].mcpServers // {}) | map_values(bridge)))
+    | reduce (($mac[0].projects // {}) | to_entries[] | select((.value.mcpServers // {}) != {})) as $p (.;
+        .projects[$p.key].mcpServers = ((.projects[$p.key].mcpServers // {}) + ($p.value.mcpServers | map_values(bridge))))' \
+    "$HOME/.claude.json" >"$HOME/.claude.json.tmp" && mv "$HOME/.claude.json.tmp" "$HOME/.claude.json" &&
+    info "MCP servers: $(jq -r '.mcpServers | keys | join(" ")' "$HOME/.claude.json")" &&
+    info "per-project MCP servers in: $(jq -r --arg h "$HOST_HOME/" '[.projects // {} | to_entries[] | select((.value.mcpServers // {}) != {}) | .key | ltrimstr($h)] | join(" ")' "$HOME/.claude.json")"
 fi
 
-# --- hook ------------------------------------------------------------------
-if [[ -n "$HOOK" ]]; then
-  step "Hook $HOOK"
-  (cd "$HOME" && MACHINE="$MACHINE" bash "$HOOK") || FAILED+=("hook $HOOK")
-fi
+# Tell agents in this machine how their environment works.
+cm="$VC/CLAUDE.md"; touch "$cm"
+cat >"$cm.block" <<EOF
+<!-- orb-workspace:start (generated, re-written on each run) -->
+# Environment: OrbStack machine "$MACHINE"
+
+You run inside an OrbStack Linux machine on the user's Mac. It exists only so a
+second Claude can run with its own login; everything else is the Mac's.
+
+- **Files:** the Mac's files, at the same paths (\`$HOST_HOME/...\`; \`~/Sites\`
+  and the other usual folders link there). The user and the Mac's Claude see
+  your changes live.
+- **Commands run on the Mac:** ${BRIDGED[*]:-none}. They run in the same folder
+  with this shell's env vars, and Node follows the project's \`.nvmrc\`. Run any
+  other Mac command with \`mac-run <command>\`. Docker is the Mac's Docker.
+- **Networking:** \`localhost\` here is this machine, not the Mac. Bridged
+  commands (curl, ...) run on the Mac, so their localhost is the Mac's. The
+  Mac's local hostnames point at the Mac, which is \`host.orb.internal\`.
+- **Temp files:** \`\$TMPDIR\` is \`~/tmp\` in this machine.
+<!-- orb-workspace:end -->
+EOF
+awk '/<!-- orb-workspace:start/{skip=1} !skip{print} /<!-- orb-workspace:end -->/{skip=0}' "$cm" >"$cm.tmp"
+sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$cm.tmp" >"$cm" && rm -f "$cm.tmp"
+[[ -s "$cm" ]] && printf '\n' >>"$cm"
+cat "$cm.block" >>"$cm" && rm -f "$cm.block"
+info "environment notes in ~/.claude/CLAUDE.md"
 
 # --- summary ---------------------------------------------------------------
 step "Done"
-info "Start it: orb -m $MACHINE, then cd ~/$(basename "${SHARES[0]}")/<repo> && claude"
-for n in ${NOTES[@]+"${NOTES[@]}"}; do info "$n"; done
+info "Start it: orb -m $MACHINE, then cd ~/Sites/<repo> && claude"
+info "Restart any Claude Code session already running in the machine."
 if ((${#FAILED[@]})); then
   warn "Needs attention:"
   for f in "${FAILED[@]}"; do warn "  $f"; done
