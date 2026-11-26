@@ -50,7 +50,7 @@ EOF
 # Mac commands that run on the Mac when called by name in the machine.
 DEFAULT_MAC_CMDS="git gh node npm npx yarn pnpm corepack php composer docker docker-compose
   xcodebuild xcrun xcode-select swift pod fastlane adb emulator sdkmanager avdmanager
-  studio phpstorm"
+  studio phpstorm curl wget mysql psql redis-cli"
 
 # --------------------------------------------------------------------------
 # Mac side: create the machine, then re-run this script inside it.
@@ -238,16 +238,20 @@ while IFS= read -r -d '' kv; do
   case "${kv%%=*}" in
     PATH|HOME|PWD|OLDPWD|SHLVL|_|TMPDIR|SHELL|USER|LOGNAME|HOSTNAME|MAIL|TERM|TERMINFO|LANG|LANGUAGE|LC_*|\
     SSH_*|XDG_*|NVM_*|DBUS_*|LS_COLORS|MOTD_SHOWN|BASH*|HIST*|PS1|PS2|PS4|IFS|MANPATH|INFOPATH|DISPLAY|\
-    ORBSTACK_*|DEBIAN_FRONTEND|GIT_EXEC_PATH|*[!A-Za-z0-9_]*) continue ;;
+    ORBSTACK_*|DEBIAN_FRONTEND|GIT_EXEC_PATH|BROWSER|*[!A-Za-z0-9_]*) continue ;;
   esac
+  # Values that point into this machine mean nothing on the Mac.
+  case "${kv#*=}" in *"$HOME"*|*/opt/orbstack*) continue ;; esac
   envs+=("$kv")
 done < <(env -0)
 cmd=$1; shift
 case "$cmd" in
   node|npm|npx|yarn|pnpm|corepack)
-    d=$PWD; while [[ "$d" != / && ! -f "$d/.nvmrc" ]]; do d=$(dirname "$d"); done
-    if [[ -f "$d/.nvmrc" ]]; then
-      exec mac env ${envs[@]+"${envs[@]}"} zsh -c '. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1; nvm use --silent >/dev/null 2>&1; exec "$@"' zsh "$cmd" "$@"
+    # Like a Mac shell: nvm's Node first, the project's .nvmrc version if it has one.
+    if mac sh -c 'test -s "$HOME/.nvm/nvm.sh"'; then
+      exec mac env ${envs[@]+"${envs[@]}"} zsh -c '. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1
+        { nvm use --silent || nvm use --silent default; } >/dev/null 2>&1
+        [ -n "$NVM_BIN" ] && PATH="$NVM_BIN:$PATH"; exec "$@"' zsh "$cmd" "$@"
     fi ;;
 esac
 exec mac env ${envs[@]+"${envs[@]}"} "$cmd" "$@"
@@ -337,6 +341,9 @@ BRIDGE_JQ='def bridge:
     { type: "stdio", command: "mac",
       args: ["sh", "-c", ("exec " + (((if (.env // {}) != {} then ["env"] + (.env | to_entries | map("\(.key)=\(.value)")) else [] end)
                                      + [.command] + (.args // [])) | map(@sh) | join(" ")))] }
+  # localhost here is this machine; the Mac is host.orb.internal.
+  elif (.url // "") | test("^https?://(localhost|127\\.0\\.0\\.1)[:/]") then
+    .url |= sub("^(?<s>https?://)(localhost|127\\.0\\.0\\.1)"; "\(.s)host.orb.internal")
   else . end;'
 
 if want claude; then
