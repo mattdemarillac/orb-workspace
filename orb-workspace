@@ -1,66 +1,56 @@
 #!/usr/bin/env bash
 # orb-workspace: run a second, separate Claude Code (its own login) in an
-# OrbStack Linux machine that otherwise matches the Mac: same repos, env files,
-# Claude config and Mac tools. Safe to re-run: each step skips what is done.
+# OrbStack Linux machine that otherwise behaves exactly like the Mac: same
+# files, same tools, same Docker, same Claude config. Safe to re-run.
 #
 # The script runs on the Mac to create the machine, then re-runs itself inside
-# the machine (the Mac filesystem is visible there under /mnt/mac).
+# the machine (the Mac filesystem is visible there under /mnt/mac and /Users).
 set -uo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: orb-workspace <machine> --org ORG [--org ORG ...] [options]
+Usage: orb-workspace <machine> [options]
 
-Creates (or updates) an OrbStack Linux machine and copies into it every Mac
-checkout whose GitHub origin belongs to one of the given orgs.
-
-Repos
-  --org ORG          GitHub owner to include (repeatable, case-insensitive)
-  --from DIR         Mac folder to scan for checkouts (repeatable, default ~/Sites)
-  --dest DIR         folder inside the machine (default ~/Sites there)
-  --repo NAME        only these folder names, after org matching (repeatable)
+Creates (or updates) an OrbStack Linux machine that runs its own Claude Code
+login and otherwise matches the Mac: it works on the Mac's folders, and its
+commands (git, gh, node, php, docker, Xcode, ...) run on the Mac.
 
 Steps (default: all of them; naming any step runs only the named ones)
-  --toolchain        apt basics, Docker Engine, gh, PHP + Composer and nvm + Node
-                     (only when a repo needs them), Claude Code, git identity
+  --toolchain        apt basics, Claude Code, your global ~/.claude/CLAUDE.md
   --folders          home folders: ~/.claude, ~/.config, ~/.cache, ~/.local/bin,
                      ~/tmp (TMPDIR), XDG user dirs, plus the --folder list
-  --mac              bridge to macOS: wrappers in ~/.local/bin that run Mac tools
-                     (Xcode, simulators, Android SDK, IDEs, the Mac's Docker as
-                     docker-mac) through OrbStack's `mac`, and a section in the
-                     machine's ~/.claude/CLAUDE.md telling agents how it all works
-  --clone            clone from the Mac checkouts: same branch, uncommitted
-                     changes, worktrees; origin rewritten to GitHub HTTPS
-  --secrets          copy gitignored env/key/cert files from the Mac checkouts,
-                     plus ~/.npmrc and Composer auth (never overwrites)
+  --shares           link each --share folder into the machine's home, so both
+                     sides edit the same files at the same paths
+  --mac              run Mac tools from the machine by name: wrappers in
+                     ~/.local/bin that run them on the Mac through OrbStack's
+                     `mac`, with this shell's env vars and the right Node
+  --hosts            point the Mac's /etc/hosts local names at the Mac
   --claude           copy the Mac's Claude Code setup: settings, hooks, plugins,
-                     skills, MCP servers, per-repo permissions (hooks and MCP
-                     servers run on the Mac via `mac`); not login/history/memory
-  --auth             gh login inside the machine (interactive); git and Composer
-                     then use it
-  --deps             seed vendor/ from the Mac, composer install, yarn / npm ci / pnpm install per repo
-  --docker           from each repo's compose file: create external networks,
-                     add host-gateway hosts to /etc/hosts, grant container uids
-                     access to the checkout; build + start the stacks in --up
+                     skills, MCP servers, per-project MCP servers (hooks and MCP
+                     servers run on the Mac); not login, history or memory
 
 Options
+  --share DIR        Mac folder to work in (repeatable, default ~/Sites)
   --folder NAME[=MACDIR]
                      home folder in the machine (repeatable). NAME alone is a
                      machine-only folder; NAME=MACDIR links it to a Mac folder.
                      Default: Downloads Documents Desktop, machine-only
-  --mac-cmd NAME     extra Mac command to bridge (repeatable)
-  --up NAME          build and start this repo's compose stack (repeatable)
-  --hook FILE        bash script run inside the machine at the end, cwd = dest,
-                     with DEST and MACHINE set (project-specific extras go here)
-  --secret-regex RE  extra regex (ERE) of gitignored paths to copy
+  --mac-cmd NAME     extra Mac command to run by name (repeatable)
+  --hook FILE        bash script run inside the machine at the end
   --distro NAME      distro for a new machine (default ubuntu)
-  --dry-run          list matching repos and the steps, change nothing
+  --dry-run          show what would be done, change nothing
   -h, --help
 
 Example
-  orb-workspace work --org acme --org acme-labs --up api --up web
+  orb-workspace work
+  orb -m work            # then: cd ~/Sites/<repo> && claude
 EOF
 }
+
+# Mac commands that run on the Mac when called by name in the machine.
+DEFAULT_MAC_CMDS="git gh node npm npx yarn pnpm corepack php composer docker docker-compose
+  xcodebuild xcrun xcode-select swift pod fastlane adb emulator sdkmanager avdmanager
+  studio phpstorm"
 
 # --------------------------------------------------------------------------
 # Mac side: create the machine, then re-run this script inside it.
@@ -74,23 +64,25 @@ if [[ "${1:-}" != "__vm" ]]; then
   SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   DISTRO=ubuntu; DRY=0; ARGS=()
 
-  # Make Mac paths absolute so they still resolve inside the machine.
+  abspath() { # absolute Mac path, ~ expanded; fails if missing
+    local p=$1; [[ "$p" == "~"* ]] && p="$HOME${p#\~}"
+    if [[ -d "$p" ]]; then (cd "$p" && pwd)
+    elif [[ -f "$p" ]]; then echo "$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
+    else return 1; fi
+  }
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --from|--hook)
+      --share|--hook)
         [[ $# -ge 2 ]] || { echo "$1 needs a value" >&2; exit 1; }
-        p=$2; [[ "$p" == "~"* ]] && p="$HOME${p#\~}"
-        if [[ -d "$p" ]]; then p="$(cd "$p" && pwd)"
-        elif [[ -f "$p" ]]; then p="$(cd "$(dirname "$p")" && pwd)/$(basename "$p")"
-        else echo "$1: $2 not found" >&2; exit 1; fi
+        p=$(abspath "$2") || { echo "$1: $2 not found" >&2; exit 1; }
         ARGS+=("$1" "$p"); shift 2 ;;
       --folder)
         [[ $# -ge 2 ]] || { echo "--folder needs a value" >&2; exit 1; }
         v=$2
         if [[ "$v" == *=* ]]; then
-          p=${v#*=}; [[ "$p" == "~"* ]] && p="$HOME${p#\~}"
-          [[ -d "$p" ]] || { echo "--folder: Mac folder $p not found" >&2; exit 1; }
-          v="${v%%=*}=$(cd "$p" && pwd)"
+          p=$(abspath "${v#*=}") || { echo "--folder: Mac folder ${v#*=} not found" >&2; exit 1; }
+          v="${v%%=*}=$p"
         fi
         ARGS+=(--folder "$v"); shift 2 ;;
       --distro) DISTRO=${2:?}; shift 2 ;;
@@ -105,10 +97,7 @@ if [[ "${1:-}" != "__vm" ]]; then
     orb create "$DISTRO" "$MACHINE" || exit 1
   fi
 
-  exec orb -m "$MACHINE" env \
-    MACHINE="$MACHINE" HOST_HOME="$HOME" \
-    GIT_NAME="$(git config --global user.name 2>/dev/null)" \
-    GIT_EMAIL="$(git config --global user.email 2>/dev/null)" \
+  exec orb -m "$MACHINE" env MACHINE="$MACHINE" HOST_HOME="$HOME" \
     bash "/mnt/mac$SELF" __vm ${ARGS[@]+"${ARGS[@]}"}
 fi
 
@@ -116,32 +105,21 @@ fi
 # Machine side.
 # --------------------------------------------------------------------------
 shift # __vm
-ORGS=(); FROM=(); ONLY=(); UP=(); FOLDERS=(); MAC_EXTRA=(); STEPS=""; HOOK=""; EXTRA_RE=""; DRY=0
-DEST="$HOME/Sites"
+SHARES=(); FOLDERS=(); MAC_EXTRA=(); STEPS=""; HOOK=""; DRY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --org) ORGS+=("${2,,}"); shift 2 ;;
-    --from) FROM+=("$2"); shift 2 ;;
-    --dest) DEST=$2; shift 2 ;;
-    --repo) ONLY+=("$2"); shift 2 ;;
-    --up) UP+=("$2"); shift 2 ;;
+    --share) SHARES+=("$2"); shift 2 ;;
     --folder) FOLDERS+=("$2"); shift 2 ;;
     --mac-cmd) MAC_EXTRA+=("$2"); shift 2 ;;
     --hook) HOOK=$2; shift 2 ;;
-    --secret-regex) EXTRA_RE=$2; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    --toolchain|--folders|--mac|--clone|--secrets|--claude|--auth|--deps|--docker) STEPS+=" ${1#--}"; shift ;;
+    --toolchain|--folders|--shares|--mac|--hosts|--claude) STEPS+=" ${1#--}"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
-
-((${#ORGS[@]})) || { echo "Give at least one --org" >&2; exit 1; }
-((${#FROM[@]})) || FROM=("$HOST_HOME/Sites")
-# A --dest typed as ~/x on the Mac arrives as /Users/<me>/x: map it to the machine's home.
-[[ "$DEST" == "$HOST_HOME"* ]] && DEST="$HOME${DEST#"$HOST_HOME"}"
-[[ -n "$STEPS" && ${#UP[@]} -gt 0 && " $STEPS " != *" docker "* ]] && STEPS+=" docker"
+((${#SHARES[@]})) || SHARES=("$HOST_HOME/Sites")
 
 LOGS="$HOME/.cache/orb-workspace"; mkdir -p "$LOGS"
 FAILED=(); NOTES=()
@@ -150,11 +128,11 @@ want() { [[ -z "$STEPS" || " $STEPS " == *" $1 "* ]]; }
 step() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
 warn() { printf '    \033[33m! %s\033[0m\n' "$*"; }
-in_list() { local x=$1; shift; local y; for y in "$@"; do [[ "$x" == "$y" ]] && return 0; done; return 1; }
+export PATH="$HOME/.local/bin:$PATH"
+
 # Environment lives in one file that login and interactive shells both load
 # (Ubuntu's .bashrc returns early for non-interactive shells, so it can't go there).
 ENV_FILE="$HOME/.orb-workspace.env"
-[[ -f "$ENV_FILE" ]] && . "$ENV_FILE"
 add_env() { # add_env 'export X=...'
   touch "$ENV_FILE"; grep -qxF "$1" "$ENV_FILE" || echo "$1" >>"$ENV_FILE"
   local src='[ -f "$HOME/.orb-workspace.env" ] && . "$HOME/.orb-workspace.env"'
@@ -163,100 +141,23 @@ add_env() { # add_env 'export X=...'
     { echo "$src"; cat "$HOME/.bashrc" 2>/dev/null; } >"$HOME/.bashrc.tmp" && mv "$HOME/.bashrc.tmp" "$HOME/.bashrc"
   fi
 }
-load_nvm() { export NVM_DIR="$HOME/.nvm"; [[ -s "$NVM_DIR/nvm.sh" ]] && . "$NVM_DIR/nvm.sh" >/dev/null 2>&1; }
-export PATH="$HOME/.local/bin:$PATH"
 
-# --- discover repos --------------------------------------------------------
-# A fresh machine has no git or jq yet, and discovery needs them.
-if ! command -v git >/dev/null || ! command -v jq >/dev/null; then
-  step "Installing git and jq"
-  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git jq >/dev/null 2>&1 ||
-    { echo "Could not install git/jq" >&2; exit 1; }
-fi
-
-NAMES=(); SRCS=(); SLUGS=(); MAINS=()
-for from in "${FROM[@]}"; do
-  for src in "/mnt/mac$from"/*/; do
-    src=${src%/}; name=$(basename "$src")
-    [[ -e "$src/.git" ]] || continue
-    url=$(git -C "$src" remote get-url origin 2>/dev/null) || continue
-    [[ "$url" == *github.com[:/]* ]] || continue
-    slug=$(sed -E 's#^(git@github\.com:|ssh://git@github\.com/|https://([^@/]+@)?github\.com/)##; s#\.git$##; s#/$##' <<<"$url")
-    owner=${slug%%/*}
-    in_list "${owner,,}" "${ORGS[@]}" || continue
-    if ((${#ONLY[@]})); then in_list "$name" "${ONLY[@]}" || continue; fi
-    if in_list "$name" ${NAMES[@]+"${NAMES[@]}"}; then warn "skipping $src: a repo named $name is already included"; continue; fi
-    main=""
-    if [[ -f "$src/.git" ]]; then # a linked worktree: remember which repo owns it
-      common=$(git -C "$src" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
-      main=$(basename "$(dirname "$common")")
-    fi
-    NAMES+=("$name"); SRCS+=("$src"); SLUGS+=("$slug"); MAINS+=("$main")
-  done
-done
-
-((${#NAMES[@]})) || { echo "No checkouts in ${FROM[*]} belong to: ${ORGS[*]}" >&2; exit 1; }
-
-step "Repos (${#NAMES[@]}) -> $DEST in machine '$MACHINE'"
-for i in "${!NAMES[@]}"; do
-  extra=""; [[ -n "${MAINS[i]}" ]] && extra="  (worktree of ${MAINS[i]})"
-  info "$(printf '%-28s %s%s' "${NAMES[i]}" "${SLUGS[i]}" "$extra")"
-done
-info "steps: ${STEPS:- toolchain folders mac clone secrets claude auth deps docker}${HOOK:+ hook}"
-((${#UP[@]})) && info "start stacks: ${UP[*]}"
+step "Machine '$MACHINE'"
+info "shares: ${SHARES[*]}"
+info "steps: ${STEPS:- toolchain folders shares mac hosts claude}${HOOK:+ hook}"
 [[ $DRY == 1 ]] && exit 0
-
-mkdir -p "$DEST"
 
 # --- toolchain -------------------------------------------------------------
 if want toolchain; then
   step "Toolchain"
-  need_php=0; need_node=0; NODES=()
-  for src in "${SRCS[@]}"; do
-    [[ -f "$src/composer.json" ]] && need_php=1
-    [[ -f "$src/package.json" ]] && need_node=1
-    if [[ -f "$src/.nvmrc" ]]; then
-      v=$(tr -d ' \r\n' <"$src/.nvmrc"); [[ -n "$v" ]] && ! in_list "$v" ${NODES[@]+"${NODES[@]}"} && NODES+=("$v")
-    fi
-  done
-
-  pkgs="git curl ca-certificates unzip openssl jq make rsync acl build-essential python3-setuptools gh docker.io docker-compose-v2 docker-buildx"
-  # Libraries common native Node modules build against (canvas, sharp, ...).
-  ((need_node)) && pkgs+=" pkg-config libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev libpixman-1-dev"
-  ((need_php)) && pkgs+=" php-cli php-xml php-gd php-mbstring php-curl php-zip php-bcmath php-mysql php-intl"
-  info "apt: installing packages"
-  sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >"$LOGS/apt.log" 2>&1 ||
-    { FAILED+=("apt install (see $LOGS/apt.log)"); warn "apt install failed"; }
-
-  id -nG | grep -qw docker || { sudo usermod -aG docker "$USER"; NOTES+=("Open a new shell in the machine for docker group access."); }
-  sudo systemctl enable --now docker >/dev/null 2>&1
-
-  if ((need_php)) && ! command -v composer >/dev/null; then
-    info "composer"
-    curl -fsSL https://getcomposer.org/installer -o /tmp/composer-setup.php &&
-      sudo php /tmp/composer-setup.php --quiet --install-dir=/usr/local/bin --filename=composer
-    rm -f /tmp/composer-setup.php
+  # Only what Claude Code itself needs here; project tools run on the Mac.
+  if ! command -v jq >/dev/null || ! command -v rsync >/dev/null || ! command -v curl >/dev/null || ! command -v rg >/dev/null; then
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null &&
+      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl ca-certificates jq rsync ripgrep >"$LOGS/apt.log" 2>&1 ||
+      { FAILED+=("apt install (see $LOGS/apt.log)"); warn "apt install failed"; }
   fi
-
-  if ((need_node)); then
-    if [[ ! -s "$HOME/.nvm/nvm.sh" ]]; then
-      info "nvm"
-      curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash >/dev/null 2>&1
-    fi
-    load_nvm
-    ((${#NODES[@]})) || NODES=("--lts")
-    for v in "${NODES[@]}"; do
-      info "node $v"
-      nvm install "$v" >/dev/null 2>&1 && npm i -g yarn >/dev/null 2>&1 || FAILED+=("node $v")
-    done
-    # Only pick a default on first install; never change one already chosen.
-    [[ -f "$NVM_DIR/alias/default" ]] || nvm alias default "${NODES[0]#--}" >/dev/null 2>&1
-  fi
-
-  if ! command -v claude >/dev/null; then
-    info "Claude Code"
+  if [[ ! -x "$HOME/.local/bin/claude" ]]; then
+    info "installing Claude Code"
     curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1 || FAILED+=("Claude Code install")
   fi
   add_env 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac'
@@ -264,16 +165,12 @@ if want toolchain; then
     mkdir -p "$HOME/.claude" && cp "/mnt/mac$HOST_HOME/.claude/CLAUDE.md" "$HOME/.claude/CLAUDE.md"
     info "copied your global CLAUDE.md"
   fi
-
-  [[ -z "$(git config --global user.name)" && -n "${GIT_NAME:-}" ]] && git config --global user.name "$GIT_NAME"
-  [[ -z "$(git config --global user.email)" && -n "${GIT_EMAIL:-}" ]] && git config --global user.email "$GIT_EMAIL"
-  git config --global init.defaultBranch main
+  info "$("$HOME/.local/bin/claude" --version 2>/dev/null || echo 'Claude Code missing')"
 fi
 
 # --- folders ---------------------------------------------------------------
 if want folders; then
   step "Home folders"
-  # What Claude Code and most CLIs expect in a home directory.
   mkdir -p "$HOME/.claude" "$HOME/.config" "$HOME/.cache" "$HOME/.local/bin" "$HOME/.local/share" "$HOME/tmp"
   chmod 700 "$HOME/tmp"
   add_env 'export TMPDIR="$HOME/tmp"'
@@ -283,19 +180,18 @@ if want folders; then
   for f in "${FOLDERS[@]}"; do
     n=${f%%=*}; p="$HOME/$n"
     if [[ "$f" == *=* ]]; then
-      t="/mnt/mac${f#*=}"
-      if [[ -L "$p" && "$(readlink "$p")" == "$t" ]]; then info "~/$n -> Mac ${f#*=}"; continue; fi
+      t="${f#*=}"
+      if [[ -L "$p" && "$(readlink "$p")" == "$t" ]]; then info "~/$n -> Mac $t"; continue; fi
       if [[ -L "$p" ]]; then rm "$p"
-      elif [[ -d "$p" ]]; then rmdir "$p" 2>/dev/null || { warn "~/$n has files in it; not linking it to ${f#*=}"; continue; }
+      elif [[ -d "$p" ]]; then rmdir "$p" 2>/dev/null || { warn "~/$n has files in it; not linking it to $t"; continue; }
       fi
-      ln -s "$t" "$p" && info "~/$n -> Mac ${f#*=}"
+      ln -s "$t" "$p" && info "~/$n -> Mac $t"
     else
       if [[ -L "$p" ]]; then warn "~/$n links to $(readlink "$p"); leaving it"; continue; fi
       mkdir -p "$p" && info "~/$n (on the Mac: ~/OrbStack/$MACHINE$p)"
     fi
   done
 
-  # XDG user dirs, so browsers and other tools save downloads in ~/Downloads.
   ud="$HOME/.config/user-dirs.dirs"
   for pair in DOWNLOAD:Downloads DOCUMENTS:Documents DESKTOP:Desktop; do
     k=${pair%%:*}; n=${pair#*:}
@@ -304,43 +200,83 @@ if want folders; then
   done
 fi
 
-# --- mac bridge ------------------------------------------------------------
+# --- shares ----------------------------------------------------------------
+# The Mac's folders are mounted here at the same path (/Users/...). Working
+# there means both Claudes edit the same files and every path means the same.
+if want shares; then
+  step "Shared folders"
+  for s in "${SHARES[@]}"; do
+    [[ -d "$s" ]] || { warn "$s is not visible in the machine"; continue; }
+    p="$HOME/$(basename "$s")"
+    if [[ -L "$p" && "$(readlink "$p")" == "$s" ]]; then info "~/$(basename "$s") -> $s"; continue; fi
+    if [[ -e "$p" && ! -L "$p" ]]; then
+      # Keep anything that was here, but out of the way.
+      aside="$p.vm-copy-$(date +%Y%m%d%H%M%S)"
+      mv "$p" "$aside" && warn "moved the machine's own ~/$(basename "$s") aside to $aside"
+    fi
+    rm -f "$p"; ln -s "$s" "$p" && info "~/$(basename "$s") -> $s (the Mac's folder)"
+  done
+fi
+
+# --- mac tools -------------------------------------------------------------
 WRAP_MARK="# orb-workspace: macOS bridge"
 if want mac; then
-  step "macOS bridge"
+  step "Mac tools"
   if ! command -v mac >/dev/null; then
     warn "OrbStack's 'mac' command is missing in this machine; skipping"
   else
     mkdir -p "$HOME/.local/bin"
-    SDK="$HOST_HOME/Library/Android/sdk"
+    # mac-run: run a command on the Mac in the same folder. `mac` passes no env
+    # vars, so this forwards the shell's own ones; Node follows the project's
+    # .nvmrc the way the Mac's shell does.
+    cat >"$HOME/.local/bin/mac-run" <<'RUN'
+#!/bin/bash
+# orb-workspace: macOS bridge
+# Usage: mac-run <command> [args...]  -- runs it on the Mac, in this folder.
+envs=()
+while IFS= read -r -d '' kv; do
+  case "${kv%%=*}" in
+    PATH|HOME|PWD|OLDPWD|SHLVL|_|TMPDIR|SHELL|USER|LOGNAME|HOSTNAME|MAIL|TERM|TERMINFO|LANG|LANGUAGE|LC_*|\
+    SSH_*|XDG_*|NVM_*|DBUS_*|LS_COLORS|MOTD_SHOWN|BASH*|HIST*|PS1|PS2|PS4|IFS|MANPATH|INFOPATH|DISPLAY|\
+    ORBSTACK_*|DEBIAN_FRONTEND|GIT_EXEC_PATH|*[!A-Za-z0-9_]*) continue ;;
+  esac
+  envs+=("$kv")
+done < <(env -0)
+cmd=$1; shift
+case "$cmd" in
+  node|npm|npx|yarn|pnpm|corepack)
+    d=$PWD; while [[ "$d" != / && ! -f "$d/.nvmrc" ]]; do d=$(dirname "$d"); done
+    if [[ -f "$d/.nvmrc" ]]; then
+      exec mac env ${envs[@]+"${envs[@]}"} zsh -c '. "$HOME/.nvm/nvm.sh" >/dev/null 2>&1; nvm use --silent >/dev/null 2>&1; exec "$@"' zsh "$cmd" "$@"
+    fi ;;
+esac
+exec mac env ${envs[@]+"${envs[@]}"} "$cmd" "$@"
+RUN
+    chmod +x "$HOME/.local/bin/mac-run"
+
     BRIDGED=()
-    for c in xcodebuild xcrun xcode-select swift pod fastlane \
-             adb emulator sdkmanager avdmanager studio phpstorm ${MAC_EXTRA[@]+"${MAC_EXTRA[@]}"}; do
+    for c in $DEFAULT_MAC_CMDS ${MAC_EXTRA[@]+"${MAC_EXTRA[@]}"}; do
       w="$HOME/.local/bin/$c"
-      # Leave real Linux commands alone; only (re)write our own wrappers.
-      existing=$(command -v "$c" 2>/dev/null)
-      if [[ -n "$existing" && "$existing" != "$w" ]]; then continue; fi
-      if [[ -f "$w" ]] && ! grep -qF "$WRAP_MARK" "$w"; then continue; fi
-      # `mac` rewrites absolute paths that exist in Linux (/usr/bin/…) to this
-      # machine's files, so commands on the Mac's PATH are called by name.
+      if [[ -f "$w" ]] && ! grep -qF "$WRAP_MARK" "$w"; then continue; fi # not ours
       target=""
-      if mac sh -lc "command -v '$c'" >/dev/null 2>&1; then
-        target=$c
+      if mac sh -lc "command -v '$c'" >/dev/null 2>&1; then target=$c
       else
         for d in platform-tools emulator cmdline-tools/latest/bin; do
-          [[ -x "/mnt/mac$SDK/$d/$c" ]] && { target="$SDK/$d/$c"; break; }
+          [[ -x "$HOST_HOME/Library/Android/sdk/$d/$c" ]] && { target="$HOST_HOME/Library/Android/sdk/$d/$c"; break; }
         done
       fi
-      [[ -n "$target" ]] || continue
-      printf '#!/bin/sh\n%s\nexec mac %q "$@"\n' "$WRAP_MARK" "$target" >"$w" && chmod +x "$w"
+      if [[ -z "$target" ]]; then rm -f "$w"; continue; fi
+      printf '#!/bin/sh\n%s\nexec mac-run %q "$@"\n' "$WRAP_MARK" "$target" >"$w" && chmod +x "$w"
       BRIDGED+=("$c")
     done
-    # The Mac's Docker, under its own name: plain `docker` is this machine's engine.
-    if mac sh -lc 'command -v docker' >/dev/null 2>&1; then
-      printf '#!/bin/sh\n%s\nexec mac docker "$@"\n' "$WRAP_MARK" >"$HOME/.local/bin/docker-mac"
-      chmod +x "$HOME/.local/bin/docker-mac"; BRIDGED+=("docker-mac")
-    fi
-    info "bridged: ${BRIDGED[*]:-nothing found}"
+    rm -f "$HOME/.local/bin/docker-mac" # docker itself is the Mac's now
+    # Interactive shells may put other tools (nvm, ...) ahead of these later in
+    # .bashrc; put the bridged commands back in front at the very end.
+    mark='# orb-workspace: bridged Mac commands first'
+    grep -qxF "$mark" "$HOME/.bashrc" 2>/dev/null ||
+      printf '\n%s\nexport PATH="$HOME/.local/bin:$PATH"\n' "$mark" >>"$HOME/.bashrc"
+    hash -r
+    info "run on the Mac: ${BRIDGED[*]:-nothing found}"
 
     # Tell agents in this machine how their environment works.
     cm="$HOME/.claude/CLAUDE.md"; mkdir -p "$HOME/.claude"; touch "$cm"
@@ -348,26 +284,20 @@ if want mac; then
 <!-- orb-workspace:start (generated, re-written on each run) -->
 # Environment: OrbStack machine "$MACHINE"
 
-You are running inside an OrbStack Linux machine (Ubuntu) on the user's Mac,
-set up for isolated agent work. Repos are in \`$DEST\`.
+You run inside an OrbStack Linux machine on the user's Mac. It exists only so a
+second Claude can run with its own login; everything else is the Mac's.
 
-- **macOS tools:** run any Mac command with \`mac <command>\`. It runs on the
-  Mac in the matching folder (this machine's files appear on the Mac under
-  \`~/OrbStack/$MACHINE$HOME\`). These run on the Mac without the prefix:
-  ${BRIDGED[*]:-none}. Use them for Xcode builds, iOS simulators
-  (\`xcrun simctl\`), the Android emulator and \`adb\`; those cannot run in Linux.
-- **Mac files:** readable at \`/mnt/mac/Users/…\`. Treat them as the user's
-  personal files: read only what the task needs and don't change them.
-- **Docker:** \`docker\` is this machine's own engine (the work stacks run
-  here). \`docker-mac\` is the Mac's OrbStack Docker.
-- **Networking:** ports published here are forwarded to the Mac's \`localhost\`
-  and reachable as \`$MACHINE.orb.local\`. Mac services are at
-  \`host.orb.internal:<port>\`.
-- **Temp files:** \`\$TMPDIR\` is \`~/tmp\`.
+- **Files:** work in the Mac's folders (\`${SHARES[*]}\`, also at \`~/$(basename "${SHARES[0]}")\`).
+  They are the same files the user and the Mac's Claude see, live.
+- **Commands run on the Mac:** ${BRIDGED[*]:-none}. They run in the same folder
+  with this shell's env vars, and Node follows the project's \`.nvmrc\`. Run any
+  other Mac command with \`mac-run <command>\`. Docker is the Mac's Docker.
+- **Networking:** the Mac's local hostnames from /etc/hosts point at the Mac,
+  and the Mac is \`host.orb.internal\`. \`localhost\` here is this machine.
+- **Temp files:** \`\$TMPDIR\` is \`~/tmp\` in this machine.
 <!-- orb-workspace:end -->
 EOF
     awk '/<!-- orb-workspace:start/{skip=1} !skip{print} /<!-- orb-workspace:end -->/{skip=0}' "$cm" >"$cm.tmp"
-    # Drop trailing blank lines, then append the fresh block.
     sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' "$cm.tmp" >"$cm" && rm -f "$cm.tmp"
     [[ -s "$cm" ]] && printf '\n' >>"$cm"
     cat "$cm.block" >>"$cm" && rm -f "$cm.block"
@@ -375,98 +305,35 @@ EOF
   fi
 fi
 
-# --- clone -----------------------------------------------------------------
-carry_changes() { # copy uncommitted work from a Mac checkout into its clone
-  local src=$1 dst=$2 name=$3
-  [[ -n "$(git -C "$src" status --porcelain)" ]] || return 0
-  if [[ -n "$(git -C "$src" diff HEAD)" ]]; then
-    git -C "$src" diff HEAD --binary | git -C "$dst" apply --whitespace=nowarn - ||
-      warn "$name: uncommitted tracked changes did not apply"
-  fi
-  (cd "$src" && git ls-files --others --exclude-standard -z | xargs -0 -r cp -a --parents -t "$dst")
-  info "$name: carried uncommitted changes"
-}
-
-if want clone; then
-  step "Clone"
-  for pass in main worktree; do
-    for i in "${!NAMES[@]}"; do
-      name=${NAMES[i]}; src=${SRCS[i]}; main=${MAINS[i]}; dst="$DEST/$name"
-      [[ $pass == main && -n "$main" ]] && continue
-      [[ $pass == worktree && -z "$main" ]] && continue
-      if [[ -e "$dst" ]]; then info "$name: already there"; continue; fi
-
-      if [[ $pass == main ]]; then
-        git clone -q "$src" "$dst" || { FAILED+=("clone $name"); continue; }
-        git -C "$dst" remote set-url origin "https://github.com/${SLUGS[i]}.git"
-      else
-        if [[ ! -d "$DEST/$main" ]]; then warn "$name: its repo $main is not included, skipping"; continue; fi
-        branch=$(git -C "$src" branch --show-current)
-        git -C "$DEST/$main" fetch -q "$src" HEAD || { FAILED+=("worktree $name"); continue; }
-        if [[ -n "$branch" ]]; then
-          git -C "$DEST/$main" rev-parse -q --verify "refs/heads/$branch" >/dev/null ||
-            git -C "$DEST/$main" branch "$branch" FETCH_HEAD
-          git -C "$DEST/$main" worktree add -q "$dst" "$branch" || { FAILED+=("worktree $name"); continue; }
-        else
-          git -C "$DEST/$main" worktree add -q --detach "$dst" FETCH_HEAD || { FAILED+=("worktree $name"); continue; }
-        fi
-      fi
-      carry_changes "$src" "$dst" "$name"
-      info "$name: $(git -C "$dst" branch --show-current || echo detached)"
-    done
-  done
-fi
-
-# --- secrets ---------------------------------------------------------------
-SECRET_RE='(^|/)(\.env(\.[A-Za-z0-9_-]+)?|[^/]+\.env|\.npmrc|auth\.json|[^/]+\.(pem|key|pub|crt|p12)|http-client\.private\.env\.json|firebase[^/]*\.json|credentials[^/]*)$|(^|/)(keys?|certs|\.auth|secrets?)/'
-[[ -n "$EXTRA_RE" ]] && SECRET_RE="$SECRET_RE|$EXTRA_RE"
-SKIP_RE='(^|/)(node_modules|vendor|\.git|mysql/data|storage|cache|\.cache|logs?|tmp|build|dist|coverage|\.next|\.nuxt|\.yarn|\.idea|\.vscode|venv|\.venv|myenv|__pycache__)(/|$)'
-
-if want secrets; then
-  step "Secrets (gitignored env/key/cert files; existing files are kept)"
-  for i in "${!NAMES[@]}"; do
-    name=${NAMES[i]}; src=${SRCS[i]}; dst="$DEST/$name"
-    [[ -d "$dst" ]] || continue
-    n=0
-    while IFS= read -r f; do
-      [[ -e "$dst/$f" ]] && continue
-      mkdir -p "$dst/$(dirname "$f")" && cp -a "$src/$f" "$dst/$f" && n=$((n + 1))
-    done < <(
-      git -C "$src" ls-files --others --ignored --exclude-standard --directory 2>/dev/null |
-        while IFS= read -r p; do
-          [[ "$p" =~ $SKIP_RE ]] && continue
-          if [[ "$p" == */ ]]; then (cd "$src" && find "$p" -maxdepth 4 -type f -size -2M 2>/dev/null)
-          else echo "$p"; fi
-        done | grep -E "$SECRET_RE" | grep -vE "$SKIP_RE"
-    )
-    ((n)) && info "$name: $n file(s)"
-  done
-
-  if [[ -f "/mnt/mac$HOST_HOME/.npmrc" && ! -f "$HOME/.npmrc" ]]; then
-    cp "/mnt/mac$HOST_HOME/.npmrc" "$HOME/.npmrc" && info "~/.npmrc"
-  fi
-  if command -v composer >/dev/null; then
-    for a in "/mnt/mac$HOST_HOME/.composer/auth.json" "/mnt/mac$HOST_HOME/.config/composer/auth.json"; do
-      [[ -f "$a" ]] || continue
-      ch=$(composer -n config --global home 2>/dev/null); mkdir -p "$ch"
-      [[ -f "$ch/auth.json" ]] || echo '{}' >"$ch/auth.json"
-      # Merge everything except the GitHub token; --auth sets a fresh one.
-      jq -s '.[1] * (.[0] | del(."github-oauth"))' "$a" "$ch/auth.json" >"$ch/auth.json.tmp" &&
-        mv "$ch/auth.json.tmp" "$ch/auth.json" && chmod 600 "$ch/auth.json" && info "composer auth.json (merged)"
-      break
-    done
+# --- hosts -----------------------------------------------------------------
+if want hosts; then
+  step "Hosts"
+  mac_ip=$(getent ahostsv4 host.orb.internal | awk 'NR==1{print $1}')
+  if [[ -z "$mac_ip" || ! -f /mnt/mac/private/etc/hosts ]]; then
+    warn "can't find the Mac (host.orb.internal) or its /etc/hosts; skipping"
+  else
+    names=$(awk '$1 ~ /^(127\.0\.0\.1|::1)$/ {for (i=2;i<=NF;i++) { if ($i ~ /^#/) break; if ($i != "localhost") print $i }}' \
+      /mnt/mac/private/etc/hosts | sort -u)
+    {
+      sed '/# orb-workspace:start/,/# orb-workspace:end/d' /etc/hosts |
+        awk -v names=" $(tr '\n' ' ' <<<"$names")" '
+          # drop plain local entries for these names: here they must point at the Mac
+          $1 == "127.0.0.1" && NF == 2 && index(names, " " $2 " ") { next } { print }'
+      echo "# orb-workspace:start (the Mac's local names point at the Mac)"
+      for n in $names; do printf '%s\t%s\n' "$mac_ip" "$n"; done
+      echo "# orb-workspace:end"
+    } >"$LOGS/hosts.new" && sudo cp "$LOGS/hosts.new" /etc/hosts
+    info "$(wc -w <<<"$names" | tr -d ' ') name(s) -> $mac_ip (the Mac)"
   fi
 fi
 
 # --- claude config ---------------------------------------------------------
-# Same Claude Code setup as the Mac (settings, hooks, plugins, skills, MCP
-# servers, per-repo permissions); only the login, history and memory differ.
-# Hooks and stdio MCP servers run on the Mac through `mac`, so Mac-only
-# programs behave exactly as they do there.
+# Same Claude Code setup as the Mac; only the login, history and memory differ.
+# Hooks and stdio MCP servers run on the Mac, so they behave exactly as there.
 BRIDGE_JQ='def bridge:
   if (.type // "stdio") == "stdio" and .command != "mac" then
     # One quoted shell string: `mac` would rewrite separate absolute-path args
-    # (/opt/homebrew/…) into this machine'"'"'s files. It also does not pass env vars.
+    # (/opt/homebrew/...) into this machine'"'"'s files. It also does not pass env vars.
     { type: "stdio", command: "mac",
       args: ["sh", "-c", ("exec " + (((if (.env // {}) != {} then ["env"] + (.env | to_entries | map("\(.key)=\(.value)")) else [] end)
                                      + [.command] + (.args // [])) | map(@sh) | join(" ")))] }
@@ -494,175 +361,30 @@ if want claude; then
 
   if [[ -f "/mnt/mac$HOST_HOME/.claude.json" ]]; then
     [[ -f "$HOME/.claude.json" ]] || echo '{}' >"$HOME/.claude.json"
-    # Map each included repo's Mac path to its path here.
-    pairs=$(for i in "${!NAMES[@]}"; do printf '%s\t%s\n' "${SRCS[i]#/mnt/mac}" "$DEST/${NAMES[i]}"; done |
-      jq -R 'split("\t") | {(.[0]): .[1]}' | jq -s 'add')
-    jq --argjson pairs "$pairs" --slurpfile mac "/mnt/mac$HOST_HOME/.claude.json" "$BRIDGE_JQ"'
+    # Projects keep their Mac paths here, so per-project MCP servers copy across as they are.
+    shares=$(printf '%s\n' "${SHARES[@]}" | jq -R . | jq -s .)
+    jq --argjson shares "$shares" --slurpfile mac "/mnt/mac$HOST_HOME/.claude.json" "$BRIDGE_JQ"'
       .mcpServers = ((.mcpServers // {}) + (($mac[0].mcpServers // {}) | map_values(bridge)))
-      | reduce ($pairs | to_entries[]) as $p (.;
-          ($mac[0].projects[$p.key].mcpServers // {}) as $m
-          | if $m == {} then . else .projects[$p.value].mcpServers = ((.projects[$p.value].mcpServers // {}) + ($m | map_values(bridge))) end)' \
+      | reduce (($mac[0].projects // {}) | to_entries[]
+                | select(.key as $k | any($shares[] as $s | ($k == $s or ($k | startswith($s + "/"))); .))
+                | select((.value.mcpServers // {}) != {})) as $p (.;
+          .projects[$p.key].mcpServers = ((.projects[$p.key].mcpServers // {}) + ($p.value.mcpServers | map_values(bridge))))' \
       "$HOME/.claude.json" >"$HOME/.claude.json.tmp" && mv "$HOME/.claude.json.tmp" "$HOME/.claude.json" &&
-      info "MCP servers: $(jq -r '.mcpServers | keys | join(" ")' "$HOME/.claude.json") (+ per-repo ones)"
+      info "MCP servers: $(jq -r '.mcpServers | keys | join(" ")' "$HOME/.claude.json")" &&
+      info "per-project MCP servers: $(jq -r '[.projects // {} | to_entries[] | select((.value.mcpServers // {}) != {}) | .key] | join(" ")' "$HOME/.claude.json")"
   fi
-
-  for i in "${!NAMES[@]}"; do
-    m="${SRCS[i]}/.claude/settings.local.json"; v="$DEST/${NAMES[i]}/.claude/settings.local.json"
-    [[ -f "$m" && -d "$DEST/${NAMES[i]}" ]] || continue
-    mkdir -p "$(dirname "$v")"; [[ -f "$v" ]] || echo '{}' >"$v"
-    # Mac settings win, but permission lists are combined so nothing approved here is lost.
-    jq -s '.[0] as $v | .[1] as $m | ($v * $m)
-      | reduce ("allow", "deny", "ask") as $k (.;
-          if ($v.permissions[$k] // $m.permissions[$k]) == null then .
-          else .permissions[$k] = ((($v.permissions[$k] // []) + ($m.permissions[$k] // [])) | unique) end)' \
-      "$v" "$m" >"$v.tmp" && mv "$v.tmp" "$v" && info "${NAMES[i]}: .claude/settings.local.json"
-  done
   NOTES+=("Restart any Claude Code session already running in the machine to pick up the config.")
-fi
-
-# --- auth ------------------------------------------------------------------
-if want auth; then
-  step "GitHub auth"
-  if ! gh auth status >/dev/null 2>&1; then
-    if [[ -t 0 ]]; then gh auth login -h github.com -p https -w
-    else warn "no terminal: run 'gh auth login -h github.com -p https -w' in the machine, then re-run with --auth"; fi
-  fi
-  if gh auth status >/dev/null 2>&1; then
-    gh auth setup-git
-    command -v composer >/dev/null && composer config --global github-oauth.github.com "$(gh auth token)"
-    info "git and composer use the gh login"
-    NOTES+=("If an org uses SAML SSO, authorise the gh token for it: GitHub > Settings > Applications > GitHub CLI > Configure SSO.")
-  else
-    FAILED+=("GitHub auth")
-  fi
-fi
-
-# --- deps ------------------------------------------------------------------
-# Env vars that package-manager configs read (${VAR} in .yarnrc.yml / .npmrc),
-# taken from the Mac's login shell so installs behave as they do on the Mac.
-import_mac_env() {
-  local v val
-  for v in $(cat "$HOME/.npmrc" "$DEST"/*/.yarnrc.yml "$DEST"/*/.npmrc 2>/dev/null |
-             grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*' | cut -c3- | sort -u); do
-    [[ -n "${!v:-}" ]] && continue
-    val=$(mac sh -c "exec \"\$SHELL\" -ilc 'printenv $v'" 2>/dev/null | tail -1)
-    [[ -n "$val" ]] || continue
-    add_env "export $v=$(printf '%q' "$val")"; chmod 600 "$ENV_FILE"
-    export "$v=$val"; info "env $v (from the Mac's login shell)"
-  done
-}
-
-node_install() { # run in the repo folder
-  if [[ -f .yarnrc.yml ]]; then corepack enable >/dev/null 2>&1; yarn install --immutable
-  elif [[ -f yarn.lock ]]; then yarn install --frozen-lockfile --non-interactive
-  elif [[ -f pnpm-lock.yaml ]]; then corepack enable >/dev/null 2>&1; pnpm install --frozen-lockfile
-  elif [[ -f package-lock.json ]]; then npm ci
-  else npm install; fi
-}
-
-# Old node-gyp (bundled with old Node versions) can't run on Python 3.11+.
-old_python() {
-  command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1
-  uv python install 3.10 >/dev/null 2>&1 && uv python find 3.10
-}
-
-if want deps; then
-  step "Dependencies (logs in $LOGS)"
-  load_nvm
-  command -v mac >/dev/null && import_mac_env
-  for i in "${!NAMES[@]}"; do
-    name=${NAMES[i]}; src=${SRCS[i]}; dst="$DEST/$name"; [[ -d "$dst" ]] || continue
-    if [[ -f "$dst/composer.json" ]] && command -v composer >/dev/null; then
-      # Start from the Mac's vendor/ (PHP is portable). Composer then only fetches
-      # what differs, so private packages the Mac already has need no GitHub access.
-      if [[ -d "$src/vendor" && ! -f "$dst/vendor/composer/installed.json" ]]; then
-        rsync -a "$src/vendor/" "$dst/vendor/" && info "$name: vendor/ seeded from the Mac"
-      fi
-      # PHP version and extensions are the containers' business; this only fetches the code.
-      if (cd "$dst" && composer install -n --no-progress --ignore-platform-reqs >"$LOGS/$name-composer.log" 2>&1); then
-        info "$name: composer ok"
-      elif [[ -f "$dst/vendor/composer/installed.json" ]]; then
-        warn "$name: composer failed, vendor/ is the Mac's copy ($LOGS/$name-composer.log)"
-      else
-        FAILED+=("$name composer ($LOGS/$name-composer.log)"); warn "$name: composer failed"
-      fi
-    fi
-    if [[ -f "$dst/package.json" ]] && command -v nvm >/dev/null; then
-      ( cd "$dst" || exit 1
-        if [[ -f .nvmrc ]]; then nvm use >/dev/null 2>&1 || { nvm install >/dev/null 2>&1 && nvm use >/dev/null 2>&1; }; else nvm use default >/dev/null 2>&1; fi
-        node_install ) >"$LOGS/$name-node.log" 2>&1
-      rc=$?
-      # Native modules written for older toolchains: old node-gyp can't run on
-      # Python 3.11+, and newer GCC no longer pulls in <cstdint> implicitly.
-      if ((rc)) && grep -qE "invalid mode: 'rU'|couldn't be built|gyp ERR" "$LOGS/$name-node.log"; then
-        info "$name: retrying native builds with older-toolchain settings"
-        py=""; grep -q "invalid mode: 'rU'" "$LOGS/$name-node.log" && py=$(old_python)
-        ( cd "$dst" || exit 1
-          if [[ -f .nvmrc ]]; then nvm use >/dev/null 2>&1; else nvm use default >/dev/null 2>&1; fi
-          [[ -n "$py" ]] && export npm_config_python="$py" PYTHON="$py"
-          export CXXFLAGS="${CXXFLAGS:-} -include cstdint"
-          node_install ) >"$LOGS/$name-node.log" 2>&1
-        rc=$?
-      fi
-      if ((rc)); then FAILED+=("$name node ($LOGS/$name-node.log)"); warn "$name: node deps failed"
-      else info "$name: node ok"; fi
-    fi
-  done
-fi
-
-# --- docker ----------------------------------------------------------------
-if want docker; then
-  step "Docker"
-  DOCKER=(docker); docker info >/dev/null 2>&1 || DOCKER=(sudo docker)
-  me=$(id -u)
-  for name in "${NAMES[@]}"; do
-    dst="$DEST/$name"; [[ -d "$dst" ]] || continue
-    compose=""
-    for c in compose.yaml compose.yml docker-compose.yml docker-compose.yaml docker/compose.yaml docker/compose.yml docker/docker-compose.yml docker/docker-compose.yaml; do
-      [[ -f "$dst/$c" ]] && { compose=$c; break; }
-    done
-    [[ -n "$compose" ]] || continue
-    json=$(cd "$dst" && "${DOCKER[@]}" compose -f "$compose" config --format json 2>"$LOGS/$name-compose.log") ||
-      { warn "$name: skipped, $compose: $(grep -v 'level=warning' "$LOGS/$name-compose.log" | head -1)"; continue; }
-
-    while IFS= read -r net; do
-      [[ -n "$net" ]] || continue
-      "${DOCKER[@]}" network inspect "$net" >/dev/null 2>&1 || { "${DOCKER[@]}" network create "$net" >/dev/null && info "network $net"; }
-    done < <(jq -r '.networks // {} | to_entries[] | select(.value.external == true) | .value.name // .key' <<<"$json")
-
-    while IFS= read -r h; do
-      [[ -n "$h" && "$h" != host.docker.internal ]] || continue
-      grep -qE "[[:space:]]$h([[:space:]]|$)" /etc/hosts || { echo "127.0.0.1       $h" | sudo tee -a /etc/hosts >/dev/null; info "hosts: $h"; }
-    done < <(jq -r '.services[]? | .extra_hosts // empty |
-        if type == "object" then to_entries[] | select((.value | tostring) | test("host-gateway")) | .key
-        else .[] | select(test("host-gateway")) | sub("[:=]host-gateway$"; "") end' <<<"$json" | sort -u)
-
-    uids=$(jq -r '.services[]?.user // empty' <<<"$json" | cut -d: -f1 | grep -E '^[0-9]+$' | sort -u | grep -vx "$me")
-    if [[ -n "$uids" && ! -f "$dst/.git/orb-workspace-acl" && ! -f "$dst/.orb-workspace-acl" ]]; then
-      for u in $uids; do sudo setfacl -R -m "u:$u:rwX,d:u:$u:rwX,u:$me:rwX,d:u:$me:rwX" "$dst"; done
-      # Remember it so re-runs skip the slow recursive pass (inside .git when it is a directory).
-      if [[ -d "$dst/.git" ]]; then touch "$dst/.git/orb-workspace-acl"; else git -C "$dst" rev-parse --git-dir >/dev/null && touch "$(git -C "$dst" rev-parse --git-dir)/orb-workspace-acl"; fi
-      info "$name: container uid(s) $(tr '\n' ' ' <<<"$uids")can write the checkout"
-    fi
-
-    if in_list "$name" ${UP[@]+"${UP[@]}"}; then
-      info "$name: building and starting ($compose)"
-      (cd "$dst" && "${DOCKER[@]}" compose -f "$compose" up -d --build) >"$LOGS/$name-up.log" 2>&1 &&
-        info "$name: up" || { FAILED+=("$name docker up ($LOGS/$name-up.log)"); warn "$name: docker up failed"; }
-    fi
-  done
-  for u in ${UP[@]+"${UP[@]}"}; do in_list "$u" "${NAMES[@]}" || warn "--up $u: no such repo"; done
 fi
 
 # --- hook ------------------------------------------------------------------
 if [[ -n "$HOOK" ]]; then
   step "Hook $HOOK"
-  (cd "$DEST" && DEST="$DEST" MACHINE="$MACHINE" bash "/mnt/mac$HOOK") || FAILED+=("hook $HOOK")
+  (cd "$HOME" && MACHINE="$MACHINE" bash "$HOOK") || FAILED+=("hook $HOOK")
 fi
 
 # --- summary ---------------------------------------------------------------
 step "Done"
-info "Open a shell: orb -m $MACHINE   (repos in $DEST)"
+info "Start it: orb -m $MACHINE, then cd ~/$(basename "${SHARES[0]}")/<repo> && claude"
 for n in ${NOTES[@]+"${NOTES[@]}"}; do info "$n"; done
 if ((${#FAILED[@]})); then
   warn "Needs attention:"

@@ -4,13 +4,14 @@ Notes for coding agents working on this repo. Read `README.md` for what the tool
 does from a user's point of view.
 
 **Purpose:** run a separate Claude Code (its own login) in an OrbStack machine.
-The machine must otherwise match the Mac: nothing more, nothing less. Judge
-every change by that: does it make the machine behave like the Mac?
+Everything else must be the Mac's: the same files, the same commands, the same
+Docker, the same Claude config. Nothing more, nothing less. Judge every change
+by that: does it make the machine behave like the Mac?
 
 ## Layout
 
 - `orb-workspace`: the whole tool, one bash script. No dependencies on the Mac
-  besides OrbStack's `orb` CLI and git.
+  besides OrbStack's `orb` CLI.
 - `README.md`: user docs. Keep the step table and options list in step with the
   script's `usage()`.
 
@@ -18,75 +19,65 @@ every change by that: does it make the machine behave like the Mac?
 
 The script runs twice:
 
-1. **On the Mac** (no `__vm` first argument). Parses the args just enough to
-   make `--from`, `--hook` and `--folder NAME=DIR` paths absolute, creates the
-   OrbStack machine if missing, then `exec`s itself inside the machine:
+1. **On the Mac** (no `__vm` first argument). Makes `--share`, `--hook` and
+   `--folder NAME=DIR` paths absolute, creates the OrbStack machine if missing,
+   then `exec`s itself inside the machine:
    `orb -m <machine> env … bash /mnt/mac<path of script> __vm <args>`.
-2. **In the machine** (`__vm`). Does all of the real work. Mac files are read
-   through `/mnt/mac/…`. `HOST_HOME`, `GIT_NAME`, `GIT_EMAIL` and `MACHINE` come
-   from the Mac side through `env`.
+2. **In the machine** (`__vm`). Does the real work. `HOST_HOME` and `MACHINE`
+   come from the Mac side.
 
-Steps run in this order: discover repos, `toolchain`, `folders`, `mac`, `clone`,
-`secrets`, `claude`, `auth`, `deps`, `docker`, hook, summary. `want <step>` decides if a
-step runs: all steps when none are named, otherwise only the named ones.
+Steps run in this order: `toolchain`, `folders`, `shares`, `mac`, `hosts`,
+`claude`, hook, summary. `want <step>` decides if a step runs: all steps when
+none are named, otherwise only the named ones.
 
 ## Rules
 
+- **Don't duplicate the Mac.** No clones, no copied secrets, no machine-side
+  Docker stacks or language runtimes. Share the Mac's folders and run tools on
+  the Mac. Duplicates drift, and edits made in the machine must show on the Mac.
 - **Mac side must stay bash 3.2 compatible** (macOS `/bin/bash`): no
   associative arrays, `mapfile`, `${x,,}` or `declare -n` above the `__vm`
-  line. Guard empty arrays with `${ARR[@]+"${ARR[@]}"}`.
+  line. Guard empty arrays with `${ARR[@]+"${ARR[@]}"}`. Don't put a heredoc
+  inside `$( … )`: bash 3.2 can fail to parse the whole file.
 - **Every step must be idempotent.** Re-running on a finished machine must
-  change nothing. Check before you create, copy or append. Never overwrite a
-  file the user may have changed (secrets use "copy only if missing").
-- **Don't change user choices.** For example the nvm default alias is set only
-  when none exists.
-- **Shell environment goes through `add_env`**, which writes
-  `~/.orb-workspace.env` and sources it from `.profile` and the top of
-  `.bashrc`. Do not append to the end of `.bashrc`: Ubuntu's `.bashrc` returns
-  early for non-interactive shells.
-- **Keep it generic.** Nothing specific to one org, repo or project goes in the
-  script. That belongs in a `--hook` script. Detect needs from the repos
-  (`composer.json`, `package.json`, `.nvmrc`, lockfiles, compose files).
-- **Failures don't stop the run.** Add them to `FAILED` (shown at the end, exit
-  code 1) and keep going. Put long output in `$LOGS/<repo>-<what>.log`.
-- **No secrets in output or logs.** Print file counts and names, never values.
-  Don't copy the GitHub token from the Mac; `--auth` makes a new one.
-- **OrbStack's `mac` rewrites absolute paths** that also exist in Linux
-  (`/usr/bin/…`, `/opt/homebrew/…`) to this machine's files, and it does not
-  pass environment variables. Call Mac commands by name (`mac xcodebuild`), or
-  wrap the whole command in one quoted string: `mac sh -c "exec 'cmd' 'arg'"`
-  (that is how bridged hooks and MCP servers work).
-  Wrappers carry the `# orb-workspace: macOS bridge` line; only those may be
-  rewritten, never a real Linux command of the same name.
+  change nothing. Never delete the user's files: move them aside.
+- **OrbStack's `mac`** rewrites absolute args that exist in Linux
+  (`/usr/bin/…`, `/opt/homebrew/…`) to the machine's files, and passes no env
+  vars. Call Mac commands by name through `mac-run` (which forwards env vars),
+  or wrap a whole command in one quoted string: `mac sh -c "exec 'cmd' 'arg'"`
+  (how bridged hooks and MCP servers work). `/Users/…` paths are safe.
+- **Wrappers** carry the `# orb-workspace: macOS bridge` line; only those may
+  be rewritten, never a real command of the same name.
 - **The machine's `~/.claude/CLAUDE.md`** belongs to the user. The script only
   replaces the part between `<!-- orb-workspace:start` and
-  `<!-- orb-workspace:end -->`.
-- **Heredocs:** don't put a heredoc inside `$( … )`; macOS bash 3.2 fails to
-  parse the whole file when the heredoc has escaped backticks. Write it to a
-  file instead.
-- **Docker** may need `sudo` until the user starts a new shell after being
-  added to the `docker` group. Use the `DOCKER` array, not `docker`.
+  `<!-- orb-workspace:end -->`. The same goes for the marked block in
+  `/etc/hosts`.
+- **Shell environment goes through `add_env`** (`~/.orb-workspace.env`, loaded
+  from `.profile` and the top of `.bashrc`). Ubuntu's `.bashrc` returns early
+  for non-interactive shells.
+- **Failures don't stop the run.** Add them to `FAILED` (shown at the end, exit
+  code 1) and keep going.
+- **No secrets in output.** Print names and counts, never values.
 
 ## Testing
 
 There are no automated tests. Before committing:
 
 ```bash
-bash -n orb-workspace                                   # syntax (Mac bash 3.2)
-orb-workspace <machine> --org <org> --dry-run           # discovery
+bash -n orb-workspace                     # syntax (Mac bash 3.2)
+orb-workspace <machine> --dry-run
 ```
 
-For anything that changes a step, test it on a throwaway machine and delete it
-afterwards:
+For anything that changes a step, test on a throwaway machine, check the
+result from inside it, then delete it:
 
 ```bash
-orb-workspace owtest --org <org> --repo <small repo> --up <small repo> \
-  --toolchain --folders --clone --secrets --deps --docker
+orb-workspace owtest
+orb -m owtest bash -lc 'cd ~/Sites/<repo> && git status && node -v && docker ps'
 orb delete -f owtest
 ```
 
-Then re-run the same command against an existing machine to check nothing is
-redone.
+Then re-run against an existing machine to check nothing is redone.
 
 ## Commits
 
